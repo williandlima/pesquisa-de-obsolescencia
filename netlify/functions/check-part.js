@@ -136,7 +136,7 @@ async function queryFarnell(pn) {
   try {
     const params = new URLSearchParams({
       term: `manuPartNum:${pn}`,
-      "storeInfo.id": "us.farnell.com",
+      "storeInfo.id": "www.newark.com",
       "resultsSettings.offset": "0",
       "resultsSettings.numberOfResults": "3",
       "resultsSettings.responseGroup": "large",
@@ -145,6 +145,16 @@ async function queryFarnell(pn) {
     });
 
     const res = await fetchWithRetry(`${FARNELL_URL}?${params.toString()}`, { method: "GET" }, 2);
+
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.includes("json")) {
+      const text = await res.text();
+      return {
+        result: null,
+        debug: `resposta não-JSON (HTTP ${res.status}): ${text.slice(0, 120).replace(/\s+/g, " ")}`,
+      };
+    }
+
     const data = await res.json();
 
     const root =
