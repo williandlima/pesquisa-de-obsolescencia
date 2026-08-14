@@ -16,6 +16,8 @@
 const MOUSER_URL = "https://api.mouser.com/api/v1/search/partnumber";
 const FARNELL_URL = "https://api.element14.com/catalog/products";
 const TRUSTEDPARTS_URL = "https://api.trustedparts.com/v2/search";
+const DIGIKEY_TOKEN_URL = "https://api.digikey.com/v1/oauth2/token";
+const DIGIKEY_SEARCH_URL = "https://api.digikey.com/products/v4/search/keyword";
 
 // Peso de cada tipo de fonte para o cálculo de confiança.
 // Distribuidor autorizado e canal-autorizado valem mais que agregador genérico.
@@ -23,6 +25,7 @@ const SOURCE_WEIGHT = {
   Mouser: 2,
   "Farnell/element14": 2,
   TrustedParts: 2,
+  DigiKey: 2,
 };
 
 function normalizeStatus(raw) {
@@ -326,6 +329,121 @@ async function queryTrustedParts(pn, mfr) {
   }
 }
 
+// ---- Fonte 4: Digi-Key (maior catálogo, milhares de fabricantes) ----
+let dkTokenCache = null;
+let dkTokenExpiry = 0;
+
+async function getDigiKeyToken() {
+  const now = Date.now();
+  if (dkTokenCache && now < dkTokenExpiry - 60000) return dkTokenCache;
+
+  const clientId = process.env.DIGIKEY_CLIENT_ID;
+  const clientSecret = process.env.DIGIKEY_CLIENT_SECRET;
+  if (!clientId || !clientSecret) return null;
+
+  const body = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: clientId,
+    client_secret: clientSecret,
+  });
+
+  const res = await fetch(DIGIKEY_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  });
+  if (!res.ok) return null;
+
+  const data = await res.json();
+  if (!data.access_token) return null;
+  dkTokenCache = data.access_token;
+  dkTokenExpiry = now + (data.expires_in || 1800) * 1000;
+  return dkTokenCache;
+}
+
+async function queryDigiKey(pn, mfr) {
+  const clientId = process.env.DIGIKEY_CLIENT_ID;
+  if (!clientId) return { result: null, debug: "não configurada" };
+
+  try {
+    const token = await getDigiKeyToken();
+    if (!token) return { result: null, debug: "falha ao obter token OAuth2" };
+
+    const res = await fetchWithRetry(
+      DIGIKEY_SEARCH_URL,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          "X-DIGIKEY-Client-Id": clientId,
+          "X-DIGIKEY-Locale-Site": "US",
+          "X-DIGIKEY-Locale-Language": "en",
+          "X-DIGIKEY-Locale-Currency": "USD",
+        },
+        body: JSON.stringify({ Keywords: pn, Limit: 10 }),
+      },
+      2
+    );
+
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.includes("json")) {
+      const text = await res.text();
+      return {
+        result: null,
+        debug: `resposta não-JSON (HTTP ${res.status}): ${text.slice(0, 120).replace(/\s+/g, " ")}`,
+      };
+    }
+    const data = await res.json();
+
+    const products = data.Products || data.ExactMatches || [];
+    if (!Array.isArray(products) || !products.length) {
+      return { result: null, debug: "componente não encontrado" };
+    }
+
+    let candidates = products.filter(
+      (p) =>
+        p.ManufacturerProductNumber &&
+        p.ManufacturerProductNumber.toLowerCase() === pn.toLowerCase()
+    );
+    if (!candidates.length) candidates = products;
+
+    if (mfr && mfr.trim()) {
+      const filtered = candidates.filter((p) =>
+        manufacturerMatches(p.Manufacturer && p.Manufacturer.Name, mfr)
+      );
+      if (filtered.length) candidates = filtered;
+    }
+
+    const match = candidates[0];
+    if (!match) return { result: null, debug: "componente não encontrado" };
+
+    const rawStatus = (match.ProductStatus && match.ProductStatus.Status) || "";
+    const status = normalizeStatus(rawStatus);
+    if (status === "unknown" && !rawStatus) {
+      return { result: null, debug: "encontrado, mas sem campo de status preenchido" };
+    }
+
+    const datasheetUrl = match.DatasheetUrl || "";
+
+    return {
+      result: {
+        source: "DigiKey",
+        status,
+        rawStatus,
+        manufacturer: (match.Manufacturer && match.Manufacturer.Name) || "",
+        substitute: "",
+        url: match.ProductUrl || "",
+        datasheetUrl,
+        leadTime: "",
+      },
+      debug: "ok",
+    };
+  } catch (e) {
+    return { result: null, debug: `erro: ${e.message}` };
+  }
+}
+
 // Calcula status final + confiança ponderada a partir das fontes que responderam.
 function combine(results) {
   // Considera só as que têm status conclusivo para votar.
@@ -396,7 +514,12 @@ exports.handler = async (event) => {
 
   const trimmedPn = pn.trim();
 
-  if (!process.env.MOUSER_API_KEY && !process.env.FARNELL_API_KEY && !process.env.TRUSTEDPARTS_API_KEY) {
+  if (
+    !process.env.MOUSER_API_KEY &&
+    !process.env.FARNELL_API_KEY &&
+    !process.env.TRUSTEDPARTS_API_KEY &&
+    !process.env.DIGIKEY_CLIENT_ID
+  ) {
     return {
       statusCode: 500,
       headers: cors,
@@ -405,19 +528,21 @@ exports.handler = async (event) => {
   }
 
   try {
-    const [mouserOut, farnellOut, tpOut] = await Promise.all([
+    const [mouserOut, farnellOut, tpOut, dkOut] = await Promise.all([
       queryMouser(trimmedPn, mfr),
       queryFarnell(trimmedPn, mfr),
       queryTrustedParts(trimmedPn, mfr),
+      queryDigiKey(trimmedPn, mfr),
     ]);
 
-    const outs = [mouserOut, farnellOut, tpOut];
+    const outs = [mouserOut, farnellOut, tpOut, dkOut];
     const results = outs.map((o) => o.result).filter(Boolean);
 
     const diagnostics = [];
     if (!mouserOut.result) diagnostics.push(`Mouser: ${mouserOut.debug}`);
     if (!farnellOut.result) diagnostics.push(`Farnell: ${farnellOut.debug}`);
     if (!tpOut.result) diagnostics.push(`TrustedParts: ${tpOut.debug}`);
+    if (!dkOut.result) diagnostics.push(`DigiKey: ${dkOut.debug}`);
     const diagSuffix = diagnostics.length ? ` [${diagnostics.join(" | ")}]` : "";
 
     // Fontes (links) e datasheets, deduplicados.
