@@ -1,33 +1,38 @@
 // Netlify Function: check-part
-// Recebe { pn, mfr } e consulta o status de lifecycle via Claude (Anthropic API)
-// com busca web real. A chave (ANTHROPIC_API_KEY) fica em variável de ambiente
-// no Netlify — NUNCA no navegador. O usuário final não precisa de chave.
+// Recebe { pn } e consulta a Mouser Search API (dados oficiais de lifecycle,
+// vindos do fabricante/distribuidor autorizado). A chave (MOUSER_API_KEY) fica
+// em variável de ambiente no Netlify — NUNCA no navegador.
 //
-// Confiabilidade: só afirma um status se a busca web retornou uma citação real
-// (página efetivamente consultada). Sem citação = "unknown", exige verificação manual.
+// Por que Mouser em vez de Nexar/Anthropic:
+// - Uma única API key, sem fluxo OAuth2 de token.
+// - Sem sistema de "part limit 0" por aplicação nova — a key já vem utilizável.
+// - Dado direto do distribuidor autorizado (LifecycleStatus, SuggestedReplacement).
 
-const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
+const SEARCH_URL = "https://api.mouser.com/api/v1/search/partnumber";
 
-function domainOf(url) {
-  try {
-    return new URL(url).hostname.replace(/^www\./, "");
-  } catch (e) {
-    return url;
+function normalizeStatus(raw) {
+  if (!raw) return "unknown";
+  const s = String(raw).toLowerCase();
+  if (
+    s.includes("obsolet") ||
+    s.includes("eol") ||
+    s.includes("end of life") ||
+    s.includes("discontinu") ||
+    s.includes("last time buy")
+  ) {
+    return "obsolete";
   }
-}
-
-function buildPrompt(pn, mfr) {
-  return `Você é um assistente técnico de engenharia eletrônica avaliando o status de lifecycle de componentes para um relatório profissional de obsolescência. Precisão é crítica: NÃO invente informação.
-
-Pesquise na web o status de lifecycle do componente de part number "${pn}"${mfr ? " do fabricante " + mfr : ""}. Consulte fontes primárias e confiáveis: página oficial do fabricante (product status / PCN), DigiKey, Mouser, Octopart, Findchips, Sourcengine.
-
-Regras obrigatórias:
-- Só afirme "active", "nrnd" ou "obsolete" se você EFETIVAMENTE encontrou essa informação em uma fonte confiável durante a busca.
-- Se a busca não retornou uma fonte que confirme o status com clareza, responda "status":"unknown" e "confidence":"low". NÃO chute.
-- "confidence":"high" só se 2+ fontes independentes concordarem; "medium" para 1 fonte confiável; "low" se ambíguo ou inferido.
-
-Responda EXCLUSIVAMENTE com um objeto JSON válido, sem markdown, sem texto antes ou depois:
-{"status":"active|nrnd|obsolete|unknown","confidence":"high|medium|low","substitute":"part number sugerido ou vazio","notes":"observação curta em português, até 25 palavras. Se unknown, explique que precisa de verificação manual."}`;
+  if (
+    s.includes("nrnd") ||
+    s.includes("not recommended") ||
+    s.includes("not for new")
+  ) {
+    return "nrnd";
+  }
+  if (s.includes("active") || s.includes("new product") || s.includes("production")) {
+    return "active";
+  }
+  return "unknown";
 }
 
 exports.handler = async (event) => {
@@ -45,9 +50,9 @@ exports.handler = async (event) => {
     return { statusCode: 405, headers: cors, body: JSON.stringify({ error: "Método não permitido" }) };
   }
 
-  let pn, mfr;
+  let pn;
   try {
-    ({ pn, mfr } = JSON.parse(event.body || "{}"));
+    ({ pn } = JSON.parse(event.body || "{}"));
   } catch {
     return { statusCode: 400, headers: cors, body: JSON.stringify({ error: "Corpo inválido" }) };
   }
@@ -55,94 +60,94 @@ exports.handler = async (event) => {
     return { statusCode: 400, headers: cors, body: JSON.stringify({ error: "Part number ausente" }) };
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.MOUSER_API_KEY;
   if (!apiKey) {
     return {
       statusCode: 500,
       headers: cors,
-      body: JSON.stringify({ error: "ANTHROPIC_API_KEY não configurada no servidor." }),
+      body: JSON.stringify({ error: "MOUSER_API_KEY não configurada no servidor." }),
     };
   }
 
   try {
-    const response = await fetch(ANTHROPIC_URL, {
+    const res = await fetch(`${SEARCH_URL}?apiKey=${encodeURIComponent(apiKey)}`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1000,
-        messages: [{ role: "user", content: buildPrompt(pn.trim(), mfr) }],
-        tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }],
+        SearchByPartRequest: {
+          mouserPartNumber: pn.trim(),
+          partSearchOptions: "None",
+        },
       }),
     });
 
-    const data = await response.json();
-    if (data.error) {
+    const data = await res.json();
+
+    const apiErrors = data.Errors || (data.SearchResults && data.SearchResults.Errors) || [];
+    if (Array.isArray(apiErrors) && apiErrors.length) {
+      const messages = apiErrors.map((e) => e.Message || e.message).filter(Boolean).join(" | ");
       return {
         statusCode: 502,
         headers: cors,
-        body: JSON.stringify({ error: data.error.message || "Erro na API Anthropic" }),
+        body: JSON.stringify({ error: `Erro na API Mouser: ${messages || "erro desconhecido"}` }),
       };
     }
 
-    const content = data.content || [];
+    const parts = (data.SearchResults && data.SearchResults.Parts) || [];
 
-    // 1) Extrai o JSON com status/confidence/substitute/notes
-    const textBlocks = content
-      .filter((b) => b.type === "text")
-      .map((b) => b.text)
-      .join("\n");
-    const jsonMatch = textBlocks.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
+    // Prioriza correspondência exata de MPN.
+    let match = parts.find(
+      (p) => p.ManufacturerPartNumber && p.ManufacturerPartNumber.toLowerCase() === pn.trim().toLowerCase()
+    );
+    if (!match) match = parts[0];
+
+    if (!match) {
       return {
-        statusCode: 502,
+        statusCode: 200,
         headers: cors,
-        body: JSON.stringify({ error: "Resposta sem JSON reconhecível" }),
+        body: JSON.stringify({
+          status: "unknown",
+          confidence: "low",
+          substitute: "",
+          manufacturer: "",
+          notes: "Componente não encontrado na base Mouser. Verificação manual necessária.",
+          sources: [],
+        }),
       };
     }
-    const parsed = JSON.parse(jsonMatch[0]);
 
-    // 2) Captura as CITAÇÕES REAIS da busca web (páginas efetivamente consultadas)
+    const rawStatus = match.LifecycleStatus || "";
+    const status = normalizeStatus(rawStatus);
+
+    // Confiança alta: dado vem direto de distribuidor autorizado.
+    const confidence = status === "unknown" ? "low" : "high";
+
+    const substitute = match.SuggestedReplacement || "";
+
     const sources = [];
-    const seen = new Set();
-    function addSource(url, title) {
-      if (!url || seen.has(url)) return;
-      seen.add(url);
-      sources.push({ url, name: title || domainOf(url) });
+    if (match.ProductDetailUrl) {
+      sources.push({ name: "Mouser", url: match.ProductDetailUrl });
+    }
+    if (match.DataSheetUrl) {
+      sources.push({ name: "Datasheet do fabricante", url: match.DataSheetUrl });
     }
 
-    content.forEach((block) => {
-      if (block.type === "text" && Array.isArray(block.citations)) {
-        block.citations.forEach((c) => {
-          if (c.type === "web_search_result_location" && c.url) {
-            addSource(c.url, c.title);
-          }
-        });
-      }
-      if (block.type === "web_search_tool_result" && Array.isArray(block.content)) {
-        block.content.forEach((r) => {
-          if (r.url) addSource(r.url, r.title);
-        });
-      }
-    });
-
-    // 3) Regra de segurança: sem fonte real confirmada => não conclusivo
-    if (sources.length === 0) {
-      parsed.status = "unknown";
-      parsed.confidence = "low";
-      parsed.notes = "Nenhuma fonte confirmada foi retornada pela busca. Verificação manual necessária.";
-    }
-
-    parsed.sources = sources.slice(0, 3);
+    const notes = rawStatus
+      ? `Lifecycle informado pela Mouser: "${rawStatus}"${match.Manufacturer ? " — " + match.Manufacturer : ""}.`
+      : "Componente encontrado, mas sem status de lifecycle cadastrado. Verificação manual recomendada.";
 
     return {
       statusCode: 200,
       headers: cors,
-      body: JSON.stringify(parsed),
+      body: JSON.stringify({
+        status,
+        confidence,
+        substitute,
+        manufacturer: match.Manufacturer || "",
+        matchedMpn: match.ManufacturerPartNumber || "",
+        notes,
+        sources,
+      }),
     };
   } catch (err) {
     return {
