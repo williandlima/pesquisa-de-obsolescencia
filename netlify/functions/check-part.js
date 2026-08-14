@@ -1,17 +1,23 @@
-// Netlify Function: check-part  (v4)
-// Consulta TRÊS fontes independentes e cruza os resultados:
+// Netlify Function: check-part  (v5)
+// Consulta QUATRO fontes independentes e cruza os resultados:
 //   1. Mouser (distribuidor autorizado)
 //   2. Farnell/element14/Newark (distribuidor autorizado)
 //   3. TrustedParts.com / ECIA (agregador SÓ de canal autorizado, 2000+ fabricantes)
+//   4. Digi-Key (maior catálogo)
 //
-// Melhorias de confiabilidade nesta versão:
-//   - Score de confiança PONDERADO por tipo e número de fontes que concordam.
+// Confiabilidade:
+//   - Score de confiança ponderado por número de fontes que concordam.
 //   - Casamento rigoroso por PN + fabricante (quando o fabricante é informado).
-//   - Captura de dados acionáveis extras: lead time, e sinal de risco de lifecycle.
-//   - Degradação graciosa: qualquer fonte pode falhar sem derrubar as outras.
+//   - Concordância entre fabricantes DIFERENTES não vira confiança alta: o mesmo
+//     PN existe em vários fabricantes com lifecycles distintos.
+//   - Degradação graciosa: qualquer fonte pode falhar sem derrubar as outras, e
+//     cada uma tem orçamento de tempo próprio (a função morre em ~10s).
 //
-// Chaves (env vars no Netlify): MOUSER_API_KEY, FARNELL_API_KEY (opcional),
-// TRUSTEDPARTS_API_KEY (opcional). Se só a Mouser estiver configurada, funciona.
+// Env vars no Netlify (todas opcionais, mas pelo menos uma precisa existir):
+//   MOUSER_API_KEY
+//   FARNELL_API_KEY
+//   TRUSTEDPARTS_API_KEY + TRUSTEDPARTS_COMPANY_ID  (a ECIA exige os dois)
+//   DIGIKEY_CLIENT_ID + DIGIKEY_CLIENT_SECRET
 
 const MOUSER_URL = "https://api.mouser.com/api/v1/search/partnumber";
 const FARNELL_URL = "https://api.element14.com/catalog/products";
@@ -62,29 +68,64 @@ function normalizeStatus(raw) {
   return "unknown";
 }
 
+// A função da Netlify é morta em ~10s. Sem teto de tempo por fonte, uma única
+// API pendurada trava as outras três e o usuário recebe um erro genérico de
+// timeout em vez dos resultados que já estavam prontos. Por isso cada fonte tem
+// orçamento próprio e cada tentativa é abortada individualmente.
+const SOURCE_DEADLINE_MS = 6500; // orçamento total de uma fonte (todas as tentativas)
+const ATTEMPT_TIMEOUT_MS = 3500; // teto de uma tentativa isolada
+
 async function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchWithRetry(url, options, maxRetries = 2) {
+async function fetchWithRetry(url, options, maxRetries = 2, deadlineMs = SOURCE_DEADLINE_MS) {
+  const started = Date.now();
+  const remaining = () => deadlineMs - (Date.now() - started);
   let lastErr;
+
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const budget = Math.min(ATTEMPT_TIMEOUT_MS, remaining());
+    if (budget <= 0) break;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), budget);
     try {
-      const res = await fetch(url, options);
-      if (res.status >= 500 && attempt < maxRetries) {
-        await sleep(400 * (attempt + 1));
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timer);
+      if (res.status >= 500 && attempt < maxRetries && remaining() > 0) {
+        await sleep(Math.min(400 * (attempt + 1), Math.max(0, remaining())));
         continue;
       }
       return res;
     } catch (err) {
+      clearTimeout(timer);
+      if (err && err.name === "AbortError") {
+        // Fonte pendurada: repetir só queimaria o orçamento das outras três,
+        // que rodam em paralelo dentro do mesmo limite de 10s da função.
+        throw new Error(`tempo esgotado (${budget}ms sem resposta)`);
+      }
       lastErr = err;
-      if (attempt < maxRetries) {
-        await sleep(400 * (attempt + 1));
+      if (attempt < maxRetries && remaining() > 0) {
+        await sleep(Math.min(400 * (attempt + 1), Math.max(0, remaining())));
         continue;
       }
     }
   }
-  throw lastErr || new Error("Falha de rede após múltiplas tentativas.");
+  throw lastErr || new Error(`tempo esgotado (${deadlineMs}ms)`);
+}
+
+// Lê a resposta como JSON, mas devolve um motivo legível quando o servidor
+// responde HTML (página de erro, portal de login, bloqueio de WAF).
+async function readJson(res) {
+  const contentType = (res.headers.get("content-type") || "").toLowerCase();
+  if (!contentType.includes("json")) {
+    const text = await res.text();
+    throw new Error(
+      `resposta não-JSON (HTTP ${res.status}): ${text.slice(0, 120).replace(/\s+/g, " ")}`
+    );
+  }
+  return res.json();
 }
 
 // Verifica se o fabricante retornado casa com o que o usuário pediu (se pediu).
@@ -113,7 +154,7 @@ async function queryMouser(pn, mfr) {
       },
       2
     );
-    const data = await res.json();
+    const data = await readJson(res);
     const errors = data.Errors || (data.SearchResults && data.SearchResults.Errors) || [];
     if (Array.isArray(errors) && errors.length) {
       return { result: null, debug: `erro: ${errors.map((e) => e.Message).join(", ")}` };
@@ -175,15 +216,7 @@ async function queryFarnell(pn, mfr) {
     });
 
     const res = await fetchWithRetry(`${FARNELL_URL}?${params.toString()}`, { method: "GET" }, 2);
-    const contentType = res.headers.get("content-type") || "";
-    if (!contentType.includes("json")) {
-      const text = await res.text();
-      return {
-        result: null,
-        debug: `resposta não-JSON (HTTP ${res.status}): ${text.slice(0, 120).replace(/\s+/g, " ")}`,
-      };
-    }
-    const data = await res.json();
+    const data = await readJson(res);
 
     const root =
       data.manufacturerPartNumberSearchReturn ||
@@ -250,10 +283,23 @@ async function queryFarnell(pn, mfr) {
 // ---- Fonte 3: TrustedParts.com (ECIA — só canal autorizado) ----
 async function queryTrustedParts(pn, mfr) {
   const apiKey = process.env.TRUSTEDPARTS_API_KEY;
+  const companyId = process.env.TRUSTEDPARTS_COMPANY_ID;
   if (!apiKey) return { result: null, debug: "não configurada" };
+  if (!companyId) {
+    return {
+      result: null,
+      debug: "falta TRUSTEDPARTS_COMPANY_ID (a API exige Company ID + API Key em toda requisição)",
+    };
+  }
 
   try {
+    // A doc da ECIA é explícita: Company ID e API Key vão no CORPO de cada
+    // requisição, em PascalCase — não em header Authorization: Bearer.
+    // O formato do bloco de peças ainda não foi confirmado ao vivo, então o
+    // debug abaixo devolve a resposta crua para revelar o schema no 1º teste.
     const body = {
+      ApiKey: apiKey,
+      CompanyId: companyId,
       PartNumber: pn,
       SearchOptions: { PartNumberSearchMode: "Exact" },
     };
@@ -265,22 +311,20 @@ async function queryTrustedParts(pn, mfr) {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
+          Accept: "application/json",
         },
         body: JSON.stringify(body),
       },
       2
     );
 
-    const contentType = res.headers.get("content-type") || "";
-    if (!contentType.includes("json")) {
-      const text = await res.text();
+    const data = await readJson(res);
+    if (res.status >= 400) {
       return {
         result: null,
-        debug: `resposta não-JSON (HTTP ${res.status}): ${text.slice(0, 120).replace(/\s+/g, " ")}`,
+        debug: `HTTP ${res.status}: ${JSON.stringify(data).slice(0, 160)}`,
       };
     }
-    const data = await res.json();
 
     // A estrutura pode variar; tenta os caminhos conhecidos da v2.
     const products = data.Products || data.products || (data.Results && data.Results.Products) || [];
@@ -347,14 +391,21 @@ async function getDigiKeyToken() {
     client_secret: clientSecret,
   });
 
-  const res = await fetch(DIGIKEY_TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
-  });
+  const res = await fetchWithRetry(
+    DIGIKEY_TOKEN_URL,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
+      },
+      body: body.toString(),
+    },
+    1
+  );
   if (!res.ok) return null;
 
-  const data = await res.json();
+  const data = await readJson(res);
   if (!data.access_token) return null;
   dkTokenCache = data.access_token;
   dkTokenExpiry = now + (data.expires_in || 1800) * 1000;
@@ -375,6 +426,9 @@ async function queryDigiKey(pn, mfr) {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          // Accept é exigido pela V4 — sua ausência é causa conhecida de
+          // HTTP 400 sem corpo de erro, difícil de diagnosticar.
+          Accept: "application/json",
           Authorization: `Bearer ${token}`,
           "X-DIGIKEY-Client-Id": clientId,
           "X-DIGIKEY-Locale-Site": "US",
@@ -386,15 +440,13 @@ async function queryDigiKey(pn, mfr) {
       2
     );
 
-    const contentType = res.headers.get("content-type") || "";
-    if (!contentType.includes("json")) {
-      const text = await res.text();
+    const data = await readJson(res);
+    if (res.status >= 400) {
       return {
         result: null,
-        debug: `resposta não-JSON (HTTP ${res.status}): ${text.slice(0, 120).replace(/\s+/g, " ")}`,
+        debug: `HTTP ${res.status}: ${JSON.stringify(data).slice(0, 160)}`,
       };
     }
-    const data = await res.json();
 
     const products = data.Products || data.ExactMatches || [];
     if (!Array.isArray(products) || !products.length) {
@@ -483,12 +535,29 @@ function combine(results) {
   }
 
   // Todas concordam. Confiança pelo nº de fontes independentes concordando.
-  const agreeing = conclusive.filter((r) => r.status === topStatus).length;
+  const agreeingSources = conclusive.filter((r) => r.status === topStatus);
+  const agreeing = agreeingSources.length;
+
+  // Duas fontes concordarem só vale como confirmação se estiverem falando da
+  // MESMA peça. O mesmo PN existe em fabricantes diferentes (LM317T da TI, da
+  // onsemi, da ST) com lifecycles diferentes — nesse caso a concordância é
+  // coincidência, não corroboração, e não pode virar confiança alta.
+  const mfrs = agreeingSources.map((r) => r.manufacturer).filter(Boolean);
+  let mfrConflict = false;
+  for (let i = 0; i < mfrs.length && !mfrConflict; i++) {
+    for (let j = i + 1; j < mfrs.length; j++) {
+      if (!manufacturerMatches(mfrs[i], mfrs[j])) {
+        mfrConflict = true;
+        break;
+      }
+    }
+  }
+
   let confidence;
-  if (agreeing >= 3) confidence = "high";
-  else if (agreeing === 2) confidence = "high";
+  if (mfrConflict) confidence = "medium";
+  else if (agreeing >= 2) confidence = "high";
   else confidence = "medium"; // fonte única
-  return { status: topStatus, confidence, agreeing };
+  return { status: topStatus, confidence, agreeing, mfrConflict };
 }
 
 exports.handler = async (event) => {
@@ -581,14 +650,21 @@ exports.handler = async (event) => {
     const manufacturer = results.find((r) => r.manufacturer)?.manufacturer || "";
     const leadTime = results.find((r) => r.leadTime)?.leadTime || "";
 
-    // Monta a nota final detalhada.
+    // Monta a nota final detalhada. Quando os fabricantes divergem, cada fonte
+    // aparece com o seu — é a informação que explica por que a confiança caiu.
     const perSource = results
-      .map((r) => `${r.source}: ${r.rawStatus || r.status}`)
+      .map((r) =>
+        combined.mfrConflict && r.manufacturer
+          ? `${r.source} (${r.manufacturer}): ${r.rawStatus || r.status}`
+          : `${r.source}: ${r.rawStatus || r.status}`
+      )
       .join("; ");
 
     let notes;
     if (combined.status === "unknown") {
       notes = `${combined.note || "Não conclusivo."} Fontes: ${perSource}.${leadTime ? " Lead time: " + leadTime + "." : ""}${diagSuffix}`;
+    } else if (combined.mfrConflict) {
+      notes = `Lifecycle: "${combined.status}" — ATENÇÃO: as fontes respondem por fabricantes diferentes para este PN, então a concordância não confirma a mesma peça. Informe o fabricante para desambiguar (${perSource}).${leadTime ? " Lead time: " + leadTime + "." : ""}${diagSuffix}`;
     } else {
       const agree =
         combined.agreeing > 1
@@ -608,6 +684,7 @@ exports.handler = async (event) => {
         notes,
         sources: sources.slice(0, 5),
         ambiguous: !!combined.diverge,
+        mfrConflict: !!combined.mfrConflict,
       }),
     };
   } catch (err) {
