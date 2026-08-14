@@ -1,88 +1,34 @@
 // Netlify Function: check-part
-// Recebe { pn } e consulta a API Nexar/Octopart (dados oficiais de lifecycle).
-// As credenciais (NEXAR_CLIENT_ID / NEXAR_CLIENT_SECRET) ficam em variáveis de
-// ambiente no Netlify — NUNCA no navegador. O usuário final não precisa de chave.
+// Recebe { pn, mfr } e consulta o status de lifecycle via Claude (Anthropic API)
+// com busca web real. A chave (ANTHROPIC_API_KEY) fica em variável de ambiente
+// no Netlify — NUNCA no navegador. O usuário final não precisa de chave.
+//
+// Confiabilidade: só afirma um status se a busca web retornou uma citação real
+// (página efetivamente consultada). Sem citação = "unknown", exige verificação manual.
 
-const IDENTITY_URL = "https://identity.nexar.com/connect/token";
-const API_URL = "https://api.nexar.com/graphql/";
+const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 
-// Cache do token em memória (dura enquanto a função estiver "quente").
-let cachedToken = null;
-let cachedTokenExpiry = 0;
-
-async function getToken() {
-  const now = Date.now();
-  // reaproveita token se ainda válido (com margem de 60s)
-  if (cachedToken && now < cachedTokenExpiry - 60000) {
-    return cachedToken;
+function domainOf(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch (e) {
+    return url;
   }
-
-  const clientId = process.env.NEXAR_CLIENT_ID;
-  const clientSecret = process.env.NEXAR_CLIENT_SECRET;
-  if (!clientId || !clientSecret) {
-    throw new Error("Credenciais Nexar não configuradas no servidor (NEXAR_CLIENT_ID / NEXAR_CLIENT_SECRET).");
-  }
-
-  const body = new URLSearchParams({
-    grant_type: "client_credentials",
-    client_id: clientId,
-    client_secret: clientSecret,
-    scope: "supply.domain",
-  });
-
-  const res = await fetch(IDENTITY_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
-  });
-
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Falha ao obter token Nexar (${res.status}): ${txt}`);
-  }
-
-  const data = await res.json();
-  cachedToken = data.access_token;
-  cachedTokenExpiry = now + (data.expires_in || 3600) * 1000;
-  return cachedToken;
 }
 
-// Normaliza os diversos rótulos de lifecycle da indústria para nosso padrão.
-function normalizeStatus(raw) {
-  if (!raw) return "unknown";
-  const s = String(raw).toLowerCase();
-  if (s.includes("obsolet") || s.includes("eol") || s.includes("end of life") || s.includes("discontinu") || s.includes("last time buy")) {
-    return "obsolete";
-  }
-  if (s.includes("nrnd") || s.includes("not recommended")) {
-    return "nrnd";
-  }
-  if (s.includes("active") || s.includes("production") || s.includes("new")) {
-    return "active";
-  }
-  return "unknown";
-}
+function buildPrompt(pn, mfr) {
+  return `Você é um assistente técnico de engenharia eletrônica avaliando o status de lifecycle de componentes para um relatório profissional de obsolescência. Precisão é crítica: NÃO invente informação.
 
-const QUERY = `
-query LifecycleByMpn($q: String!) {
-  supSearchMpn(q: $q, limit: 3) {
-    results {
-      part {
-        mpn
-        manufacturer { name }
-        octopartUrl
-        bestDatasheet { url }
-        specs {
-          attribute { shortname }
-          displayValue
-        }
-        sellers {
-          company { name }
-        }
-      }
-    }
-  }
-}`;
+Pesquise na web o status de lifecycle do componente de part number "${pn}"${mfr ? " do fabricante " + mfr : ""}. Consulte fontes primárias e confiáveis: página oficial do fabricante (product status / PCN), DigiKey, Mouser, Octopart, Findchips, Sourcengine.
+
+Regras obrigatórias:
+- Só afirme "active", "nrnd" ou "obsolete" se você EFETIVAMENTE encontrou essa informação em uma fonte confiável durante a busca.
+- Se a busca não retornou uma fonte que confirme o status com clareza, responda "status":"unknown" e "confidence":"low". NÃO chute.
+- "confidence":"high" só se 2+ fontes independentes concordarem; "medium" para 1 fonte confiável; "low" se ambíguo ou inferido.
+
+Responda EXCLUSIVAMENTE com um objeto JSON válido, sem markdown, sem texto antes ou depois:
+{"status":"active|nrnd|obsolete|unknown","confidence":"high|medium|low","substitute":"part number sugerido ou vazio","notes":"observação curta em português, até 25 palavras. Se unknown, explique que precisa de verificação manual."}`;
+}
 
 exports.handler = async (event) => {
   const cors = {
@@ -99,9 +45,9 @@ exports.handler = async (event) => {
     return { statusCode: 405, headers: cors, body: JSON.stringify({ error: "Método não permitido" }) };
   }
 
-  let pn;
+  let pn, mfr;
   try {
-    ({ pn } = JSON.parse(event.body || "{}"));
+    ({ pn, mfr } = JSON.parse(event.body || "{}"));
   } catch {
     return { statusCode: 400, headers: cors, body: JSON.stringify({ error: "Corpo inválido" }) };
   }
@@ -109,94 +55,94 @@ exports.handler = async (event) => {
     return { statusCode: 400, headers: cors, body: JSON.stringify({ error: "Part number ausente" }) };
   }
 
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return {
+      statusCode: 500,
+      headers: cors,
+      body: JSON.stringify({ error: "ANTHROPIC_API_KEY não configurada no servidor." }),
+    };
+  }
+
   try {
-    const token = await getToken();
-    const res = await fetch(API_URL, {
+    const response = await fetch(ANTHROPIC_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
       },
-      body: JSON.stringify({ query: QUERY, variables: { q: pn.trim() } }),
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1000,
+        messages: [{ role: "user", content: buildPrompt(pn.trim(), mfr) }],
+        tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }],
+      }),
     });
 
-    const data = await res.json();
-    if (data.errors) {
-      const messages = data.errors.map(e => e.message).filter(Boolean).join(" | ");
+    const data = await response.json();
+    if (data.error) {
       return {
         statusCode: 502,
         headers: cors,
-        body: JSON.stringify({
-          error: `Erro na API Nexar: ${messages || "erro desconhecido"}`,
-          details: data.errors,
-        }),
+        body: JSON.stringify({ error: data.error.message || "Erro na API Anthropic" }),
       };
     }
 
-    const results = (data.data && data.data.supSearchMpn && data.data.supSearchMpn.results) || [];
+    const content = data.content || [];
 
-    // Procura a melhor correspondência: MPN exato tem prioridade.
-    let match = results.find(r => r.part && r.part.mpn && r.part.mpn.toLowerCase() === pn.trim().toLowerCase());
-    if (!match) match = results[0];
-
-    if (!match || !match.part) {
+    // 1) Extrai o JSON com status/confidence/substitute/notes
+    const textBlocks = content
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join("\n");
+    const jsonMatch = textBlocks.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
       return {
-        statusCode: 200,
+        statusCode: 502,
         headers: cors,
-        body: JSON.stringify({
-          status: "unknown",
-          confidence: "low",
-          substitute: "",
-          manufacturer: "",
-          notes: "Componente não encontrado na base Octopart. Verificação manual necessária.",
-          sources: [],
-        }),
+        body: JSON.stringify({ error: "Resposta sem JSON reconhecível" }),
       };
     }
+    const parsed = JSON.parse(jsonMatch[0]);
 
-    const part = match.part;
-    const specs = part.specs || [];
-    const findSpec = (shortname) => {
-      const s = specs.find(x => x.attribute && x.attribute.shortname === shortname);
-      return s ? s.displayValue : null;
-    };
-
-    const mfrLifecycle = findSpec("manufacturerlifecyclestatus");
-    const homogenized = findSpec("lifecyclestatus");
-    const rawStatus = mfrLifecycle || homogenized;
-    const status = normalizeStatus(rawStatus);
-
-    // Confiança: alta se veio do fabricante, média se homogeneizado, baixa se nada.
-    let confidence = "low";
-    if (mfrLifecycle) confidence = "high";
-    else if (homogenized) confidence = "medium";
-
-    if (status === "unknown") confidence = "low";
-
+    // 2) Captura as CITAÇÕES REAIS da busca web (páginas efetivamente consultadas)
     const sources = [];
-    if (part.octopartUrl) {
-      sources.push({ name: "Octopart", url: part.octopartUrl });
-    }
-    if (part.bestDatasheet && part.bestDatasheet.url) {
-      sources.push({ name: "Datasheet do fabricante", url: part.bestDatasheet.url });
+    const seen = new Set();
+    function addSource(url, title) {
+      if (!url || seen.has(url)) return;
+      seen.add(url);
+      sources.push({ url, name: title || domainOf(url) });
     }
 
-    const notes = rawStatus
-      ? `Lifecycle informado: "${rawStatus}"${part.manufacturer ? " — " + part.manufacturer.name : ""}.`
-      : "Componente encontrado, mas sem campo de lifecycle na base. Verificação manual recomendada.";
+    content.forEach((block) => {
+      if (block.type === "text" && Array.isArray(block.citations)) {
+        block.citations.forEach((c) => {
+          if (c.type === "web_search_result_location" && c.url) {
+            addSource(c.url, c.title);
+          }
+        });
+      }
+      if (block.type === "web_search_tool_result" && Array.isArray(block.content)) {
+        block.content.forEach((r) => {
+          if (r.url) addSource(r.url, r.title);
+        });
+      }
+    });
+
+    // 3) Regra de segurança: sem fonte real confirmada => não conclusivo
+    if (sources.length === 0) {
+      parsed.status = "unknown";
+      parsed.confidence = "low";
+      parsed.notes = "Nenhuma fonte confirmada foi retornada pela busca. Verificação manual necessária.";
+    }
+
+    parsed.sources = sources.slice(0, 3);
 
     return {
       statusCode: 200,
       headers: cors,
-      body: JSON.stringify({
-        status,
-        confidence: status === "unknown" ? "low" : confidence,
-        substitute: "",
-        manufacturer: part.manufacturer ? part.manufacturer.name : "",
-        matchedMpn: part.mpn,
-        notes,
-        sources,
-      }),
+      body: JSON.stringify(parsed),
     };
   } catch (err) {
     return {
