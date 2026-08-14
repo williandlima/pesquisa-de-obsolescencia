@@ -72,7 +72,7 @@ async function fetchWithRetry(url, options, maxRetries = 2) {
 // ---- Fonte 1: Mouser ----
 async function queryMouser(pn) {
   const apiKey = process.env.MOUSER_API_KEY;
-  if (!apiKey) return null; // fonte não configurada, não é erro fatal
+  if (!apiKey) return { result: null, debug: "não configurada" };
 
   try {
     const res = await fetchWithRetry(
@@ -88,33 +88,50 @@ async function queryMouser(pn) {
     );
     const data = await res.json();
     const errors = data.Errors || (data.SearchResults && data.SearchResults.Errors) || [];
-    if (Array.isArray(errors) && errors.length) return null;
+    if (Array.isArray(errors) && errors.length) {
+      return { result: null, debug: `erro: ${errors.map((e) => e.Message).join(", ")}` };
+    }
 
     const parts = (data.SearchResults && data.SearchResults.Parts) || [];
-    const match =
-      parts.find((p) => p.ManufacturerPartNumber && p.ManufacturerPartNumber.toLowerCase() === pn.toLowerCase()) ||
-      parts[0];
-    if (!match) return null;
+    let exactMatches = parts.filter(
+      (p) => p.ManufacturerPartNumber && p.ManufacturerPartNumber.toLowerCase() === pn.toLowerCase()
+    );
+    if (!exactMatches.length) exactMatches = parts.slice(0, 1);
+    if (!exactMatches.length) return { result: null, debug: "componente não encontrado" };
+
+    // Entre todos os resultados exatos (podem ser fabricantes/SKUs diferentes),
+    // prioriza o primeiro que TEM o campo de lifecycle preenchido — evita
+    // "unknown" só porque bateu num registro de catálogo incompleto.
+    const withStatus = exactMatches.find((p) => p.LifecycleStatus && p.LifecycleStatus.trim());
+    const match = withStatus || exactMatches[0];
 
     const rawStatus = match.LifecycleStatus || "";
+    const status = normalizeStatus(rawStatus);
+    if (status === "unknown" && !rawStatus) {
+      return { result: null, debug: "encontrado, mas sem campo de lifecycle preenchido" };
+    }
+
     return {
-      source: "Mouser",
-      status: normalizeStatus(rawStatus),
-      rawStatus,
-      manufacturer: match.Manufacturer || "",
-      substitute: match.SuggestedReplacement || "",
-      url: match.ProductDetailUrl || "",
-      datasheetUrl: match.DataSheetUrl || "",
+      result: {
+        source: "Mouser",
+        status,
+        rawStatus,
+        manufacturer: match.Manufacturer || "",
+        substitute: match.SuggestedReplacement || "",
+        url: match.ProductDetailUrl || "",
+        datasheetUrl: match.DataSheetUrl || "",
+      },
+      debug: "ok",
     };
   } catch (e) {
-    return null; // degrada graciosamente
+    return { result: null, debug: `erro: ${e.message}` };
   }
 }
 
 // ---- Fonte 2: Farnell / element14 / Newark ----
 async function queryFarnell(pn) {
   const apiKey = process.env.FARNELL_API_KEY;
-  if (!apiKey) return null; // fonte opcional, não configurada
+  if (!apiKey) return { result: null, debug: "não configurada" };
 
   try {
     const params = new URLSearchParams({
@@ -130,25 +147,26 @@ async function queryFarnell(pn) {
     const res = await fetchWithRetry(`${FARNELL_URL}?${params.toString()}`, { method: "GET" }, 2);
     const data = await res.json();
 
-    // A Farnell varia o nome da raiz dependendo do tipo de busca — tenta as conhecidas.
     const root =
       data.manufacturerPartNumberSearchReturn ||
       data.keywordSearchReturn ||
       data.premierFarnellPartNumberReturn ||
       null;
-    if (!root || !Array.isArray(root.products) || !root.products.length) return null;
+    if (!root) {
+      return { result: null, debug: `formato de resposta inesperado: ${Object.keys(data).join(",") || "vazio"}` };
+    }
+    if (!Array.isArray(root.products) || !root.products.length) {
+      return { result: null, debug: "componente não encontrado" };
+    }
 
     const products = root.products;
     const match =
       products.find(
         (p) =>
-          (p.translatedManufacturerPartNumber || p.manufacturerPartNumber || "")
-            .toLowerCase() === pn.toLowerCase()
+          (p.translatedManufacturerPartNumber || p.manufacturerPartNumber || "").toLowerCase() === pn.toLowerCase()
       ) || products[0];
-    if (!match) return null;
+    if (!match) return { result: null, debug: "componente não encontrado" };
 
-    // releaseStatusCode: 4=Active, 6=To be Discontinued, 7=Discontinued
-    // productStatus: STOCKED/NO_LONGER_MANUFACTURED/etc — usado como reforço.
     const codeMap = { "4": "active", "6": "nrnd", "7": "obsolete" };
     let status = "unknown";
     let rawStatus = "";
@@ -159,22 +177,27 @@ async function queryFarnell(pn) {
       rawStatus = match.productStatus;
       status = normalizeStatus(match.productStatus);
     }
-    if (status === "unknown") return null;
+    if (status === "unknown") {
+      return { result: null, debug: "encontrado, mas sem campo de status reconhecível" };
+    }
 
     const datasheetUrl =
       (Array.isArray(match.datasheets) && match.datasheets[0] && match.datasheets[0].url) || "";
 
     return {
-      source: "Farnell/element14",
-      status,
-      rawStatus,
-      manufacturer: match.vendorName || match.brandName || "",
-      substitute: "",
-      url: match.productURL || match.translatedURL || "",
-      datasheetUrl,
+      result: {
+        source: "Farnell/element14",
+        status,
+        rawStatus,
+        manufacturer: match.vendorName || match.brandName || "",
+        substitute: "",
+        url: match.productURL || match.translatedURL || "",
+        datasheetUrl,
+      },
+      debug: "ok",
     };
   } catch (e) {
-    return null; // degrada graciosamente — Farnell é fonte complementar, não crítica
+    return { result: null, debug: `erro: ${e.message}` };
   }
 }
 
@@ -211,8 +234,14 @@ exports.handler = async (event) => {
 
   try {
     // Consulta as duas fontes em paralelo — uma falhar não derruba a outra.
-    const [mouser, farnell] = await Promise.all([queryMouser(trimmedPn), queryFarnell(trimmedPn)]);
-    const results = [mouser, farnell].filter(Boolean);
+    const [mouserOut, farnellOut] = await Promise.all([queryMouser(trimmedPn), queryFarnell(trimmedPn)]);
+    const results = [mouserOut.result, farnellOut.result].filter(Boolean);
+
+    // Diagnóstico: por que uma fonte não contribuiu (visível no log, não só "sumiu").
+    const diagnostics = [];
+    if (!mouserOut.result) diagnostics.push(`Mouser: ${mouserOut.debug}`);
+    if (!farnellOut.result) diagnostics.push(`Farnell: ${farnellOut.debug}`);
+    const diagSuffix = diagnostics.length ? ` [${diagnostics.join(" | ")}]` : "";
 
     if (!results.length) {
       return {
@@ -223,7 +252,7 @@ exports.handler = async (event) => {
           confidence: "low",
           substitute: "",
           manufacturer: "",
-          notes: "Componente não encontrado nas bases consultadas (Mouser/Farnell). Verificação manual necessária.",
+          notes: `Componente não encontrado nas bases consultadas. Verificação manual necessária.${diagSuffix}`,
           sources: [],
         }),
       };
@@ -262,8 +291,10 @@ exports.handler = async (event) => {
     const manufacturer = results.find((r) => r.manufacturer)?.manufacturer || "";
 
     const agreementNote =
-      results.length > 1 ? ` (${results.length} fontes independentes concordam: ${results.map((r) => r.source).join(", ")})` : ` (fonte: ${results[0].source})`;
-    const notes = `Lifecycle: "${results[0].rawStatus || status}"${manufacturer ? " — " + manufacturer : ""}${agreementNote}.`;
+      results.length > 1
+        ? ` (${results.length} fontes independentes concordam: ${results.map((r) => r.source).join(", ")})`
+        : ` (fonte: ${results[0].source})`;
+    const notes = `Lifecycle: "${results[0].rawStatus || status}"${manufacturer ? " — " + manufacturer : ""}${agreementNote}.${diagSuffix}`;
 
     return {
       statusCode: 200,
