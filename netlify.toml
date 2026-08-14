@@ -1,0 +1,12 @@
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+
+# Redireciona /api/check-part para a função serverless
+[[redirects]]
+  from = "/api/check-part"
+  to = "/.netlify/functions/check-part"
+  status = 200
