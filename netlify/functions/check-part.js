@@ -1,14 +1,15 @@
 // Netlify Function: check-part
-// Recebe { pn, mfr } e consulta a Mouser Search API (dados oficiais de lifecycle).
-// A chave (MOUSER_API_KEY) fica em variável de ambiente no Netlify.
+// Consulta DUAS fontes independentes de distribuidor autorizado — Mouser e
+// Farnell/element14 — e cruza os resultados. Quando as duas concordam, a
+// confiança sobe para "high" de verdade (não é só uma fonte dizendo).
+// Se uma das fontes falhar ou não tiver o dado, o app degrada graciosamente
+// e usa só a outra, em vez de quebrar.
 //
-// Melhorias de confiabilidade:
-// 1) Detecta quando o MPN é fabricado por mais de uma empresa e os status
-//    divergem entre elas — nesse caso não escolhe uma resposta arbitrária,
-//    marca como ambíguo e lista os fabricantes/status encontrados.
-// 2) Retry automático (até 2 tentativas extras) em falhas de rede/5xx.
+// Chaves em variáveis de ambiente no Netlify: MOUSER_API_KEY, FARNELL_API_KEY.
+// FARNELL_API_KEY é opcional — se ausente, o app funciona só com Mouser.
 
-const SEARCH_URL = "https://api.mouser.com/api/v1/search/partnumber";
+const MOUSER_URL = "https://api.mouser.com/api/v1/search/partnumber";
+const FARNELL_URL = "https://api.element14.com/catalog/products";
 
 function normalizeStatus(raw) {
   if (!raw) return "unknown";
@@ -18,14 +19,26 @@ function normalizeStatus(raw) {
     s.includes("eol") ||
     s.includes("end of life") ||
     s.includes("discontinu") ||
-    s.includes("last time buy")
+    s.includes("last time buy") ||
+    s.includes("no longer manufactured")
   ) {
     return "obsolete";
   }
-  if (s.includes("nrnd") || s.includes("not recommended") || s.includes("not for new")) {
+  if (
+    s.includes("nrnd") ||
+    s.includes("not recommended") ||
+    s.includes("not for new") ||
+    s.includes("to be discontinued")
+  ) {
     return "nrnd";
   }
-  if (s.includes("active") || s.includes("new product") || s.includes("production")) {
+  if (
+    s.includes("active") ||
+    s.includes("new product") ||
+    s.includes("production") ||
+    s.includes("extending the range") ||
+    s.includes("direct ship")
+  ) {
     return "active";
   }
   return "unknown";
@@ -35,8 +48,7 @@ async function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Chama a Mouser com retry automático em falhas transitórias (rede, 5xx).
-async function fetchMouserWithRetry(url, options, maxRetries = 2) {
+async function fetchWithRetry(url, options, maxRetries = 2) {
   let lastErr;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -54,7 +66,116 @@ async function fetchMouserWithRetry(url, options, maxRetries = 2) {
       }
     }
   }
-  throw lastErr || new Error("Falha de rede ao consultar a Mouser após múltiplas tentativas.");
+  throw lastErr || new Error("Falha de rede após múltiplas tentativas.");
+}
+
+// ---- Fonte 1: Mouser ----
+async function queryMouser(pn) {
+  const apiKey = process.env.MOUSER_API_KEY;
+  if (!apiKey) return null; // fonte não configurada, não é erro fatal
+
+  try {
+    const res = await fetchWithRetry(
+      `${MOUSER_URL}?apiKey=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          SearchByPartRequest: { mouserPartNumber: pn, partSearchOptions: "None" },
+        }),
+      },
+      2
+    );
+    const data = await res.json();
+    const errors = data.Errors || (data.SearchResults && data.SearchResults.Errors) || [];
+    if (Array.isArray(errors) && errors.length) return null;
+
+    const parts = (data.SearchResults && data.SearchResults.Parts) || [];
+    const match =
+      parts.find((p) => p.ManufacturerPartNumber && p.ManufacturerPartNumber.toLowerCase() === pn.toLowerCase()) ||
+      parts[0];
+    if (!match) return null;
+
+    const rawStatus = match.LifecycleStatus || "";
+    return {
+      source: "Mouser",
+      status: normalizeStatus(rawStatus),
+      rawStatus,
+      manufacturer: match.Manufacturer || "",
+      substitute: match.SuggestedReplacement || "",
+      url: match.ProductDetailUrl || "",
+      datasheetUrl: match.DataSheetUrl || "",
+    };
+  } catch (e) {
+    return null; // degrada graciosamente
+  }
+}
+
+// ---- Fonte 2: Farnell / element14 / Newark ----
+async function queryFarnell(pn) {
+  const apiKey = process.env.FARNELL_API_KEY;
+  if (!apiKey) return null; // fonte opcional, não configurada
+
+  try {
+    const params = new URLSearchParams({
+      term: `manuPartNum:${pn}`,
+      "storeInfo.id": "us.farnell.com",
+      "resultsSettings.offset": "0",
+      "resultsSettings.numberOfResults": "3",
+      "resultsSettings.responseGroup": "large",
+      "callInfo.responseDataFormat": "JSON",
+      "callInfo.apiKey": apiKey,
+    });
+
+    const res = await fetchWithRetry(`${FARNELL_URL}?${params.toString()}`, { method: "GET" }, 2);
+    const data = await res.json();
+
+    // A Farnell varia o nome da raiz dependendo do tipo de busca — tenta as conhecidas.
+    const root =
+      data.manufacturerPartNumberSearchReturn ||
+      data.keywordSearchReturn ||
+      data.premierFarnellPartNumberReturn ||
+      null;
+    if (!root || !Array.isArray(root.products) || !root.products.length) return null;
+
+    const products = root.products;
+    const match =
+      products.find(
+        (p) =>
+          (p.translatedManufacturerPartNumber || p.manufacturerPartNumber || "")
+            .toLowerCase() === pn.toLowerCase()
+      ) || products[0];
+    if (!match) return null;
+
+    // releaseStatusCode: 4=Active, 6=To be Discontinued, 7=Discontinued
+    // productStatus: STOCKED/NO_LONGER_MANUFACTURED/etc — usado como reforço.
+    const codeMap = { "4": "active", "6": "nrnd", "7": "obsolete" };
+    let status = "unknown";
+    let rawStatus = "";
+    if (match.releaseStatusCode !== undefined && codeMap[String(match.releaseStatusCode)]) {
+      status = codeMap[String(match.releaseStatusCode)];
+      rawStatus = `releaseStatusCode ${match.releaseStatusCode}`;
+    } else if (match.productStatus) {
+      rawStatus = match.productStatus;
+      status = normalizeStatus(match.productStatus);
+    }
+    if (status === "unknown") return null;
+
+    const datasheetUrl =
+      (Array.isArray(match.datasheets) && match.datasheets[0] && match.datasheets[0].url) || "";
+
+    return {
+      source: "Farnell/element14",
+      status,
+      rawStatus,
+      manufacturer: match.vendorName || match.brandName || "",
+      substitute: "",
+      url: match.productURL || match.translatedURL || "",
+      datasheetUrl,
+    };
+  } catch (e) {
+    return null; // degrada graciosamente — Farnell é fonte complementar, não crítica
+  }
 }
 
 exports.handler = async (event) => {
@@ -65,69 +186,35 @@ exports.handler = async (event) => {
     "Content-Type": "application/json",
   };
 
-  if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 204, headers: cors, body: "" };
-  }
-  if (event.httpMethod !== "POST") {
+  if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: cors, body: "" };
+  if (event.httpMethod !== "POST")
     return { statusCode: 405, headers: cors, body: JSON.stringify({ error: "Método não permitido" }) };
-  }
 
-  let pn, mfr;
+  let pn;
   try {
-    ({ pn, mfr } = JSON.parse(event.body || "{}"));
+    ({ pn } = JSON.parse(event.body || "{}"));
   } catch {
     return { statusCode: 400, headers: cors, body: JSON.stringify({ error: "Corpo inválido" }) };
   }
-  if (!pn || !pn.trim()) {
+  if (!pn || !pn.trim())
     return { statusCode: 400, headers: cors, body: JSON.stringify({ error: "Part number ausente" }) };
-  }
 
-  const apiKey = process.env.MOUSER_API_KEY;
-  if (!apiKey) {
+  const trimmedPn = pn.trim();
+
+  if (!process.env.MOUSER_API_KEY && !process.env.FARNELL_API_KEY) {
     return {
       statusCode: 500,
       headers: cors,
-      body: JSON.stringify({ error: "MOUSER_API_KEY não configurada no servidor." }),
+      body: JSON.stringify({ error: "Nenhuma fonte configurada (MOUSER_API_KEY / FARNELL_API_KEY) no servidor." }),
     };
   }
 
   try {
-    const res = await fetchMouserWithRetry(
-      `${SEARCH_URL}?apiKey=${encodeURIComponent(apiKey)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          SearchByPartRequest: {
-            mouserPartNumber: pn.trim(),
-            partSearchOptions: "None",
-          },
-        }),
-      },
-      2
-    );
+    // Consulta as duas fontes em paralelo — uma falhar não derruba a outra.
+    const [mouser, farnell] = await Promise.all([queryMouser(trimmedPn), queryFarnell(trimmedPn)]);
+    const results = [mouser, farnell].filter(Boolean);
 
-    const data = await res.json();
-
-    const apiErrors = data.Errors || (data.SearchResults && data.SearchResults.Errors) || [];
-    if (Array.isArray(apiErrors) && apiErrors.length) {
-      const messages = apiErrors.map((e) => e.Message || e.message).filter(Boolean).join(" | ");
-      return {
-        statusCode: 502,
-        headers: cors,
-        body: JSON.stringify({ error: `Erro na API Mouser: ${messages || "erro desconhecido"}` }),
-      };
-    }
-
-    const parts = (data.SearchResults && data.SearchResults.Parts) || [];
-
-    // Todas as correspondências exatas de MPN (pode haver mais de um fabricante).
-    let exactMatches = parts.filter(
-      (p) => p.ManufacturerPartNumber && p.ManufacturerPartNumber.toLowerCase() === pn.trim().toLowerCase()
-    );
-    if (!exactMatches.length) exactMatches = parts.slice(0, 1);
-
-    if (!exactMatches.length) {
+    if (!results.length) {
       return {
         statusCode: 200,
         headers: cors,
@@ -136,70 +223,47 @@ exports.handler = async (event) => {
           confidence: "low",
           substitute: "",
           manufacturer: "",
-          notes: "Componente não encontrado na base Mouser. Verificação manual necessária.",
+          notes: "Componente não encontrado nas bases consultadas (Mouser/Farnell). Verificação manual necessária.",
           sources: [],
         }),
       };
     }
 
-    // Se o usuário informou o fabricante, filtra por ele.
-    let candidates = exactMatches;
-    if (mfr && mfr.trim()) {
-      const mfrFiltered = exactMatches.filter(
-        (p) => p.Manufacturer && p.Manufacturer.toLowerCase().includes(mfr.trim().toLowerCase())
-      );
-      if (mfrFiltered.length) candidates = mfrFiltered;
-    }
-
-    // Agrupa por fabricante único e verifica se os status concordam.
-    const byManufacturer = {};
-    candidates.forEach((p) => {
-      const key = p.Manufacturer || "Desconhecido";
-      if (!byManufacturer[key]) byManufacturer[key] = p;
+    const distinctStatuses = [...new Set(results.map((r) => r.status))];
+    const sources = results
+      .filter((r) => r.url)
+      .map((r) => ({ name: r.source, url: r.url }));
+    results.forEach((r) => {
+      if (r.datasheetUrl) sources.push({ name: `Datasheet (${r.source})`, url: r.datasheetUrl });
     });
-    const manufacturers = Object.keys(byManufacturer);
-    const statusesFound = manufacturers.map((m) => normalizeStatus(byManufacturer[m].LifecycleStatus));
-    const distinctStatuses = [...new Set(statusesFound)];
 
-    // AMBÍGUO: mais de um fabricante, com status diferentes, sem filtro que resolva.
-    if (manufacturers.length > 1 && distinctStatuses.length > 1) {
-      const breakdown = manufacturers
-        .map((m) => `${m}: ${byManufacturer[m].LifecycleStatus || "sem status"}`)
-        .join("; ");
+    // Duas fontes, resultados diferentes => ambíguo, não escolhe arbitrariamente.
+    if (results.length > 1 && distinctStatuses.length > 1) {
+      const breakdown = results.map((r) => `${r.source}: ${r.rawStatus || r.status}`).join("; ");
       return {
         statusCode: 200,
         headers: cors,
         body: JSON.stringify({
           status: "unknown",
           confidence: "low",
-          substitute: "",
-          manufacturer: manufacturers.join(", "),
-          notes: `Ambíguo: ${manufacturers.length} fabricantes com status diferentes (${breakdown}). Especifique o fabricante para um resultado preciso.`,
-          sources: candidates
-            .filter((p) => p.ProductDetailUrl)
-            .slice(0, 3)
-            .map((p) => ({ name: `Mouser (${p.Manufacturer})`, url: p.ProductDetailUrl })),
+          substitute: results.find((r) => r.substitute)?.substitute || "",
+          manufacturer: results[0].manufacturer,
+          notes: `Fontes divergem: ${breakdown}. Verificação manual recomendada.`,
+          sources: sources.slice(0, 4),
           ambiguous: true,
         }),
       };
     }
 
-    // Único fabricante (ou todos concordam) — segue fluxo normal.
-    const match = candidates[0];
-    const rawStatus = match.LifecycleStatus || "";
-    const status = normalizeStatus(rawStatus);
-    const confidence = status === "unknown" ? "low" : "high";
-    const substitute = match.SuggestedReplacement || "";
-
-    const sources = [];
-    if (match.ProductDetailUrl) sources.push({ name: "Mouser", url: match.ProductDetailUrl });
-    if (match.DataSheetUrl) sources.push({ name: "Datasheet do fabricante", url: match.DataSheetUrl });
+    // Concordância (ou fonte única) — confiança alta se 2 fontes bateram.
+    const status = results[0].status;
+    const confidence = results.length > 1 ? "high" : "medium";
+    const substitute = results.find((r) => r.substitute)?.substitute || "";
+    const manufacturer = results.find((r) => r.manufacturer)?.manufacturer || "";
 
     const agreementNote =
-      manufacturers.length > 1 ? ` (${manufacturers.length} fabricantes concordam)` : "";
-    const notes = rawStatus
-      ? `Lifecycle informado pela Mouser: "${rawStatus}"${match.Manufacturer ? " — " + match.Manufacturer : ""}${agreementNote}.`
-      : "Componente encontrado, mas sem status de lifecycle cadastrado. Verificação manual recomendada.";
+      results.length > 1 ? ` (${results.length} fontes independentes concordam: ${results.map((r) => r.source).join(", ")})` : ` (fonte: ${results[0].source})`;
+    const notes = `Lifecycle: "${results[0].rawStatus || status}"${manufacturer ? " — " + manufacturer : ""}${agreementNote}.`;
 
     return {
       statusCode: 200,
@@ -208,17 +272,12 @@ exports.handler = async (event) => {
         status,
         confidence,
         substitute,
-        manufacturer: match.Manufacturer || "",
-        matchedMpn: match.ManufacturerPartNumber || "",
+        manufacturer,
         notes,
-        sources,
+        sources: sources.slice(0, 4),
       }),
     };
   } catch (err) {
-    return {
-      statusCode: 500,
-      headers: cors,
-      body: JSON.stringify({ error: err.message || "Erro interno" }),
-    };
+    return { statusCode: 500, headers: cors, body: JSON.stringify({ error: err.message || "Erro interno" }) };
   }
 };
