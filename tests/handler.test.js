@@ -177,6 +177,67 @@ async function invoke({ env, routes, body }) {
     check("Mouser também deveria explicar HTTP 500 legivelmente", /Mouser: (erro: )?resposta não-JSON \(HTTP 500\)/.test(parsed.notes), true);
   }
 
+  console.log("\n== handler: fonte lenta porém funcional (regressão Farnell) ==");
+  {
+    // A element14/Farnell passa dos 3s com frequência. Um teto curto descartaria
+    // uma fonte que teria respondido — é o que aconteceu em produção.
+    const slowButOk = () =>
+      new Promise((resolve) =>
+        setTimeout(
+          () => resolve(jsonRes({
+            manufacturerPartNumberSearchReturn: {
+              products: [{ translatedManufacturerPartNumber: "LM317T", vendorName: "onsemi", releaseStatusCode: 7 }],
+            },
+          })),
+          5000
+        )
+      );
+    const { parsed } = await invoke({
+      env: { FARNELL_API_KEY: "f" },
+      routes: [["element14", slowButOk]],
+      body: { pn: "LM317T" },
+    });
+    info(`Farnell respondendo em 5s => status=${parsed.status}`);
+    check("fonte que leva 5s ainda é aproveitada", parsed.status, "obsolete");
+  }
+
+  console.log("\n== handler: erro de token da Digi-Key é explicado ==");
+  {
+    const { parsed } = await invoke({
+      env: { MOUSER_API_KEY: "k", DIGIKEY_CLIENT_ID: "id", DIGIKEY_CLIENT_SECRET: "errado" },
+      routes: [
+        ["api.mouser.com", () => jsonRes(mouserBody([
+          { ManufacturerPartNumber: "LM317T", Manufacturer: "onsemi", LifecycleStatus: "Obsolete" }]))],
+        ["oauth2/token", () => jsonRes({ error: "invalid_client", error_description: "Client credentials are invalid" }, 401)],
+      ],
+      body: { pn: "LM317T" },
+    });
+    info(`notas: ${parsed.notes.slice(parsed.notes.indexOf("DigiKey"))}`);
+    check("motivo real do erro aparece nas notas",
+      /DigiKey: token HTTP 401.*invalid_client.*Client credentials are invalid/.test(parsed.notes), true);
+  }
+
+  console.log("\n== handler: lead time zerado não é anunciado ==");
+  {
+    const { parsed } = await invoke({
+      env: { MOUSER_API_KEY: "k" },
+      routes: [["api.mouser.com", () => jsonRes(mouserBody([
+        { ManufacturerPartNumber: "LM317T", Manufacturer: "onsemi", LifecycleStatus: "Obsolete", LeadTime: "0 Dias" }]))]],
+      body: { pn: "LM317T" },
+    });
+    info(`notas: ${parsed.notes}`);
+    check("'Lead time: 0 Dias' é omitido", /Lead time/.test(parsed.notes), false);
+  }
+  {
+    const { parsed } = await invoke({
+      env: { MOUSER_API_KEY: "k" },
+      routes: [["api.mouser.com", () => jsonRes(mouserBody([
+        { ManufacturerPartNumber: "X", Manufacturer: "TI", LifecycleStatus: "Active", LeadTime: "84 Dias" }]))]],
+      body: { pn: "X" },
+    });
+    check("lead time real continua aparecendo", /Lead time: 84 Dias/.test(parsed.notes), true);
+  }
+
   console.log("\n== handler: latência / timeout (limite de 10s da Netlify) ==");
   {
     const slow = () => new Promise((r) => setTimeout(() => r(jsonRes(mouserBody([]))), 3000));
@@ -213,13 +274,16 @@ async function invoke({ env, routes, body }) {
       ],
       body: { pn: "X" },
     });
-    const race = await Promise.race([done, new Promise((r) => setTimeout(() => r("TIMEOUT"), 4000))]);
+    // O contrato é caber nos 10s da Netlify com folga, não ser instantâneo: o
+    // teto é generoso de propósito para não descartar fonte lenta que funciona.
+    const LIMITE_MS = 9000;
+    const race = await Promise.race([done, new Promise((r) => setTimeout(() => r("TIMEOUT"), LIMITE_MS))]);
     if (race === "TIMEOUT") {
       fail++;
-      console.log(`  FAIL uma fonte pendurada trava o handler inteiro (>4s, sem AbortController)`);
+      console.log(`  FAIL fonte pendurada levou o handler além de ${LIMITE_MS}ms (a Netlify mata em 10s)`);
     } else {
       pass++;
-      console.log(`  ok   fonte pendurada não travou (${Date.now() - t0}ms)`);
+      console.log(`  ok   fonte pendurada abortada e as outras entregaram (${Date.now() - t0}ms)`);
     }
   }
 

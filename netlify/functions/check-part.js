@@ -72,8 +72,13 @@ function normalizeStatus(raw) {
 // API pendurada trava as outras três e o usuário recebe um erro genérico de
 // timeout em vez dos resultados que já estavam prontos. Por isso cada fonte tem
 // orçamento próprio e cada tentativa é abortada individualmente.
-const SOURCE_DEADLINE_MS = 6500; // orçamento total de uma fonte (todas as tentativas)
-const ATTEMPT_TIMEOUT_MS = 3500; // teto de uma tentativa isolada
+//
+// O teto precisa ser generoso: as fontes rodam EM PARALELO, então o tempo total
+// da função é o da fonte mais lenta, não a soma. Um teto curto não acelera nada
+// — só descarta fonte lenta que teria respondido. A element14/Farnell passa dos
+// 3s com frequência, e perder uma fonte boa é pior que esperar mais um pouco.
+const SOURCE_DEADLINE_MS = 7500; // orçamento total de uma fonte (todas as tentativas)
+const ATTEMPT_TIMEOUT_MS = 7000; // teto de uma tentativa isolada
 
 async function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -377,13 +382,16 @@ async function queryTrustedParts(pn, mfr) {
 let dkTokenCache = null;
 let dkTokenExpiry = 0;
 
+// Devolve { token } ou { error }. O motivo precisa chegar até as notas do
+// resultado: "falha ao obter token" sozinho não diz se a credencial está errada,
+// se é de sandbox, ou se a aplicação não tem a Product Information habilitada.
 async function getDigiKeyToken() {
   const now = Date.now();
-  if (dkTokenCache && now < dkTokenExpiry - 60000) return dkTokenCache;
+  if (dkTokenCache && now < dkTokenExpiry - 60000) return { token: dkTokenCache };
 
   const clientId = process.env.DIGIKEY_CLIENT_ID;
   const clientSecret = process.env.DIGIKEY_CLIENT_SECRET;
-  if (!clientId || !clientSecret) return null;
+  if (!clientId || !clientSecret) return { error: "faltam DIGIKEY_CLIENT_ID/DIGIKEY_CLIENT_SECRET" };
 
   const body = new URLSearchParams({
     grant_type: "client_credentials",
@@ -391,25 +399,44 @@ async function getDigiKeyToken() {
     client_secret: clientSecret,
   });
 
-  const res = await fetchWithRetry(
-    DIGIKEY_TOKEN_URL,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json",
+  let res;
+  try {
+    res = await fetchWithRetry(
+      DIGIKEY_TOKEN_URL,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "application/json",
+        },
+        body: body.toString(),
       },
-      body: body.toString(),
-    },
-    1
-  );
-  if (!res.ok) return null;
+      1
+    );
+  } catch (e) {
+    return { error: `token: ${e.message}` };
+  }
 
-  const data = await readJson(res);
-  if (!data.access_token) return null;
+  let data;
+  try {
+    data = await readJson(res);
+  } catch (e) {
+    return { error: `token HTTP ${res.status}: ${e.message}` };
+  }
+
+  if (!res.ok || !data.access_token) {
+    // O endpoint de token devolve error/error_description — é o que diz se o
+    // client_id não existe, se o secret está errado ou se o app é de sandbox.
+    const detail =
+      [data.error, data.error_description || data.ErrorMessage]
+        .filter(Boolean)
+        .join(" — ") || JSON.stringify(data).slice(0, 160);
+    return { error: `token HTTP ${res.status}: ${detail}` };
+  }
+
   dkTokenCache = data.access_token;
   dkTokenExpiry = now + (data.expires_in || 1800) * 1000;
-  return dkTokenCache;
+  return { token: dkTokenCache };
 }
 
 async function queryDigiKey(pn, mfr) {
@@ -417,8 +444,8 @@ async function queryDigiKey(pn, mfr) {
   if (!clientId) return { result: null, debug: "não configurada" };
 
   try {
-    const token = await getDigiKeyToken();
-    if (!token) return { result: null, debug: "falha ao obter token OAuth2" };
+    const { token, error: tokenError } = await getDigiKeyToken();
+    if (!token) return { result: null, debug: tokenError || "falha ao obter token OAuth2" };
 
     const res = await fetchWithRetry(
       DIGIKEY_SEARCH_URL,
@@ -648,7 +675,9 @@ exports.handler = async (event) => {
     const combined = combine(results);
     const substitute = results.find((r) => r.substitute)?.substitute || "";
     const manufacturer = results.find((r) => r.manufacturer)?.manufacturer || "";
-    const leadTime = results.find((r) => r.leadTime)?.leadTime || "";
+    // Lead time zerado é o valor default do catálogo quando não há prazo, não um
+    // prazo de zero dia — anunciá-lo numa peça obsoleta induz ao erro.
+    const leadTime = results.find((r) => r.leadTime && !/^0\s*\D*$/.test(String(r.leadTime).trim()))?.leadTime || "";
 
     // Monta a nota final detalhada. Quando os fabricantes divergem, cada fonte
     // aparece com o seu — é a informação que explica por que a confiança caiu.
