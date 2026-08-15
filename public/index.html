@@ -466,7 +466,7 @@
     <div class="search-panel" style="margin-bottom:20px; border-color:rgba(74,222,128,0.3);">
       <p style="font-size:12.5px; color:var(--silk-dim); margin:0; line-height:1.6;">
         <span style="color:var(--led-green); font-family:var(--mono); font-size:11px; text-transform:uppercase; letter-spacing:0.06em;">✓ Verificação automática pronta para uso</span><br>
-        Este app consulta a base <strong style="color:var(--silk);">Octopart/Nexar</strong> (dados oficiais de lifecycle) através de um servidor seguro. Você não precisa configurar nenhuma chave — basta digitar o part number e verificar.
+        Este app cruza <strong style="color:var(--silk);">Mouser, Farnell/Newark, TrustedParts (ECIA) e Digi-Key</strong> através de um servidor seguro, e só afirma um status quando alguma fonte confirma. Você não precisa configurar nenhuma chave — basta digitar o part number e verificar. Informar o fabricante deixa o resultado bem mais confiável.
       </p>
     </div>
 
@@ -496,7 +496,7 @@
 
     <div class="batch-panel">
       <h2>Pesquisar lista</h2>
-      <p class="sub">Cole uma lista de part numbers (um por linha) ou carregue uma planilha/CSV com os PNs na primeira coluna. Cada item é verificado individualmente na web e adicionado ao log com fonte e confiança.</p>
+      <p class="sub">Cole uma lista de part numbers (um por linha) ou carregue uma planilha/CSV com os PNs na primeira coluna. Se houver uma coluna de fabricante, ela é aproveitada automaticamente — você também pode digitar <code style="font-family:var(--mono); font-size:11.5px;">PN, Fabricante</code> por linha, o que evita confundir o mesmo PN entre fabricantes diferentes. Aceita CSV com vírgula ou ponto-e-vírgula (Excel pt-BR).</p>
 
       <div class="batch-input-row">
         <div style="flex:2; min-width:260px;">
@@ -509,7 +509,8 @@
       </div>
 
       <div class="search-row">
-        <button class="btn-primary" style="background:var(--led-green); color:#0a2015;" onclick="runBatchCheck()">Processar lista</button>
+        <button class="btn-primary" id="runBatchBtn" style="background:var(--led-green); color:#0a2015;" onclick="runBatchCheck()">Processar lista</button>
+        <button class="btn-secondary" id="cancelBatchBtn" style="display:none;" onclick="cancelBatch()">Cancelar</button>
         <button class="btn-export" id="exportBtn" onclick="exportLogToExcel()">Exportar relatório (.xlsx)</button>
       </div>
 
@@ -644,14 +645,35 @@
         <li>
           <span class="m-num">6</span>
           <div>
-            <p class="m-title">Automatize para BOMs grandes</p>
-            <p class="m-desc">Para checar dezenas de componentes de uma vez (ex.: BOM completo do LabTester Pro ou de um novo projeto STM32), um script Python usando a API do Nexar/Octopart processa o CSV inteiro e devolve status + substituto sugerido — evita repetir esse processo manualmente a cada revisão de projeto.</p>
+            <p class="m-title">Canal autorizado como prova de que a peça está viva</p>
+            <p class="m-desc">TrustedParts.com (mantido pela ECIA) lista <em>só</em> distribuidor autorizado — sem broker, sem marketplace. Se um PN ainda tem estoque autorizado com vários distribuidores, isso é sinal forte de peça ativa; se sumiu do canal autorizado e só aparece em broker, trate como obsoleta mesmo que nenhum PCN tenha saído.</p>
+          </div>
+        </li>
+        <li>
+          <span class="m-num">7</span>
+          <div>
+            <p class="m-title">Deu EOL: calcule a janela de Last-Time-Buy</p>
+            <p class="m-desc">O PDN/PCN abre uma janela de última compra — pelo padrão JEDEC, tipicamente ~6 meses para colocar o pedido e ~12 para receber. Dimensione a LTB pelo histórico real de demanda mais a vida restante do produto, não pela projeção otimista, e decida ali mesmo entre estocar ou redesenhar. É a decisão mais cara de adiar.</p>
+          </div>
+        </li>
+        <li>
+          <span class="m-num">8</span>
+          <div>
+            <p class="m-title">Peça já obsoleta: aftermarket autorizado antes de broker</p>
+            <p class="m-desc">Rochester Electronics e similares são fontes autorizadas de peça descontinuada (muitas vezes com die e licença originais do fabricante) — é o primeiro lugar a olhar depois que a LTB fechou. Broker e marketplace são último recurso, e só com rastreabilidade e relatório de teste: é onde entra o risco de falsificado.</p>
+          </div>
+        </li>
+        <li>
+          <span class="m-num">9</span>
+          <div>
+            <p class="m-title">Reverificação periódica</p>
+            <p class="m-desc">Status de lifecycle envelhece: "Active" checado há 8 meses não é evidência de nada hoje. O log marca com ⚠ os registros com mais de 90 dias e o relatório exportado traz a coluna "Revalidar?" — reprocesse a lista antes de cada revisão de projeto ou compra.</p>
           </div>
         </li>
       </ul>
     </div>
 
-    <footer>Dados de lifecycle via Octopart/Nexar. Verificação automática sem chave para o usuário. Log salvo no navegador via localStorage.</footer>
+    <footer>Dados de lifecycle cruzados entre Mouser, Farnell/Newark, TrustedParts (ECIA) e Digi-Key. Verificação automática sem chave para o usuário. Log salvo no navegador via localStorage.</footer>
   </div>
 </div>
 
@@ -691,6 +713,41 @@ const SOURCES = (pn, mfr) => {
       url: `https://www.lcsc.com/search?q=${q}`
     },
     {
+      name: 'TrustedParts (ECIA)',
+      desc: 'Só canal autorizado — estoque aqui é sinal forte de peça viva; ausência é sinal de alerta',
+      url: `https://www.trustedparts.com/en/search/${q}`
+    },
+    {
+      name: 'Rochester Electronics',
+      desc: 'Fonte autorizada de peça descontinuada — primeiro lugar a olhar depois que a LTB fechou',
+      url: `https://www.rocelec.com/search?searchTerm=${q}`
+    },
+    {
+      name: 'Farnell / Newark',
+      desc: 'Lifecycle status do distribuidor autorizado (mesma base consultada automaticamente)',
+      url: `https://www.newark.com/search?st=${q}`
+    },
+    {
+      name: 'TME',
+      desc: 'Distribuidor europeu — útil para confirmar disponibilidade fora dos EUA',
+      url: `https://www.tme.eu/en/katalog/?search=${q}`
+    },
+    {
+      name: 'RS Components',
+      desc: 'Distribuidor autorizado com ficha de status e alternativas',
+      url: `https://export.rsdelivers.com/productlist?searchTerm=${q}`
+    },
+    {
+      name: 'OEMsecrets',
+      desc: 'Agregador amplo de preço e estoque — bom para achar quem ainda tem peça em fim de vida',
+      url: `https://www.oemsecrets.com/compare/${q}`
+    },
+    {
+      name: 'NetComponents',
+      desc: 'Rede de brokers — último recurso, exige rastreabilidade e relatório de teste',
+      url: `https://www.netcomponents.com/`
+    },
+    {
       name: 'Sourcengine',
       desc: 'Marketplace da Sourceability — cole o PN na busca do site (status de lifecycle exibido na ficha)',
       url: `https://www.sourcengine.com/products`
@@ -699,12 +756,14 @@ const SOURCES = (pn, mfr) => {
 };
 
 async function checkPartNumberViaAPI(pn, mfr){
-  // Chama a função serverless (Netlify), que consulta a API oficial Octopart/Nexar.
-  // Nenhuma credencial trafega pelo navegador — o usuário final não precisa de chave.
+  // Chama a função serverless (Netlify), que cruza Mouser, Farnell/Newark,
+  // TrustedParts e Digi-Key. Nenhuma credencial trafega pelo navegador.
+  // O fabricante precisa ir junto: é ele que impede confundir o mesmo PN
+  // entre fabricantes diferentes (LM317T da TI x onsemi x ST).
   const response = await fetch("/api/check-part", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ pn })
+    body: JSON.stringify({ pn, mfr: mfr || "" })
   });
 
   let data;
@@ -764,7 +823,7 @@ async function autoCheck(){
   const btn = document.getElementById('autoCheckBtn');
 
   led.className = 'led unknown pulsing';
-  statusText.textContent = `Verificando "${pn}" na base Octopart/Nexar...`;
+  statusText.textContent = `Verificando "${pn}" nas fontes de distribuidor autorizado...`;
   autoResultEl.innerHTML = '';
   btn.disabled = true;
   btn.textContent = 'Verificando...';
@@ -803,7 +862,9 @@ function renderAutoResult(pn, result){
     ? (result.sources || []).map(s => {
         const mark = (s.reachable === false) ? ' ⚠' : (s.reachable === true ? ' ✓' : '');
         const title = (s.reachable === false) ? 'Link pode estar inacessível — confirme manualmente' : '';
-        return `<a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer" title="${title}">${escapeHtml(s.name)}${mark}</a>`;
+        const href = safeUrl(s.url);
+        if(!href) return `<span style="color:var(--silk-dim);">${escapeHtml(s.name)}</span>`;
+        return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer" title="${title}">${escapeHtml(s.name)}${mark}</a>`;
       }).join('')
     : '<span style="color:var(--silk-dim); font-size:12px;">Nenhuma fonte confirmada — verificação manual necessária.</span>';
 
@@ -811,11 +872,16 @@ function renderAutoResult(pn, result){
     ? `<div class="aline" style="color:var(--led-amber);">⚠ Status não confirmado automaticamente. Use os links de busca manual e confirme antes de registrar.</div>`
     : '';
 
+  const warnMfr = result.mfrConflict
+    ? `<div class="aline" style="color:var(--led-amber);">⚠ As fontes responderam por <strong>fabricantes diferentes</strong> para este PN — a concordância entre elas não confirma que é a mesma peça. Preencha o campo Fabricante e verifique de novo.</div>`
+    : '';
+
   autoResultEl.innerHTML = `
     <div class="auto-result">
       <div class="aline"><span class="alabel">Status:</span> <span class="tag ${result.status}">${STATUS_LABEL[result.status] || 'Não conclusivo'}</span> <span class="conf ${result.confidence}">${CONF_LABEL[result.confidence] || 'Média'}</span></div>
-      ${result.substitute ? `<div class="aline"><span class="alabel">Substituto sugerido:</span> ${escapeHtml(result.substitute)}</div>` : ''}
+      ${result.substitute ? `<div class="aline"><span class="alabel">Substituto sugerido:</span> ${escapeHtml(formatSubstitute(result.substitute, result.substituteSource))}</div>` : ''}
       <div class="aline"><span class="alabel">Notas:</span> ${escapeHtml(result.notes || '')}</div>
+      ${warnMfr}
       ${warnUnknown}
       <div class="aline"><span class="alabel">Fontes efetivamente consultadas na busca:</span></div>
       <div class="auto-sources">${sourcesHtml}</div>
@@ -829,8 +895,11 @@ function fillLogFromAuto(){
   if(!result) return;
   document.getElementById('logStatus').value = result.status || 'unknown';
   document.getElementById('logConfidence').value = result.confidence || 'medium';
-  document.getElementById('logSub').value = result.substitute || '';
+  document.getElementById('logSub').value = formatSubstitute(result.substitute, result.substituteSource);
   document.getElementById('logNotes').value = result.notes || '';
+  // Mostra qual fabricante as fontes casaram, para o registro ficar identificado.
+  const mfrField = document.getElementById('mfr');
+  if(!mfrField.value.trim() && result.manufacturer) mfrField.value = result.manufacturer;
   if(result.sources && result.sources[0]){
     document.getElementById('logSourceUrl').value = result.sources[0].url || '';
     document.getElementById('logSourceName').value = result.sources[0].name || '';
@@ -838,6 +907,77 @@ function fillLogFromAuto(){
   document.getElementById('logPn').scrollIntoView({behavior:'smooth', block:'center'});
 }
 // ---- Busca em lista ----
+
+// Detecta o separador real do arquivo. O Excel em pt-BR exporta CSV com ';',
+// não com ',' — sem isso a linha inteira ("LM317T;5") vira "part number".
+function detectDelimiter(text){
+  const firstLines = text.split(/\r?\n/).filter(l => l.trim()).slice(0, 5);
+  const candidates = [';', ',', '\t'];
+  let best = ',', bestScore = -1;
+  candidates.forEach(d => {
+    const counts = firstLines.map(l => l.split(d).length - 1);
+    const score = counts.length ? Math.min(...counts) : 0;
+    if(score > bestScore){ bestScore = score; best = d; }
+  });
+  return bestScore > 0 ? best : ',';
+}
+
+// Parser de CSV que respeita aspas (campos como "REG LDO, 1.2-37V" são comuns
+// em BOM exportado e quebram um split ingênuo).
+function parseDelimited(text, delim){
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for(let i = 0; i < text.length; i++){
+    const c = text[i];
+    if(inQuotes){
+      if(c === '"'){
+        if(text[i+1] === '"'){ field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else if(c === '"'){
+      inQuotes = true;
+    } else if(c === delim){
+      row.push(field); field = '';
+    } else if(c === '\n'){
+      row.push(field); rows.push(row); row = []; field = '';
+    } else if(c !== '\r'){
+      field += c;
+    }
+  }
+  if(field.length || row.length){ row.push(field); rows.push(row); }
+  return rows.map(r => r.map(f => f.trim()));
+}
+
+const HEADER_RE = /^(part\s*number|part[\s_-]?no|pn|mpn|c[oó]digo|componente)$/i;
+const MFR_RE = /^(fabricante|manufacturer|mfr|mfg|marca|brand|maker)$/i;
+
+// Converte a planilha/CSV em linhas "PN" ou "PN, Fabricante", aproveitando a
+// coluna de fabricante quando existir — é ela que desambigua o mesmo PN entre
+// fabricantes diferentes na verificação.
+function rowsToBatchLines(rows){
+  if(!rows.length) return [];
+  let mfrCol = -1;
+  const header = rows[0] || [];
+  const hasHeader = HEADER_RE.test((header[0] || '').trim());
+  if(hasHeader){
+    for(let i = 1; i < header.length; i++){
+      if(MFR_RE.test((header[i] || '').trim())){ mfrCol = i; break; }
+    }
+  }
+  return rows.slice(hasHeader ? 1 : 0).map(r => {
+    const pn = (r[0] || '').trim();
+    if(!pn) return '';
+    const mfr = mfrCol >= 0 ? (r[mfrCol] || '').trim() : '';
+    return mfr ? `${pn}, ${mfr}` : pn;
+  }).filter(Boolean);
+}
+
+// Cada linha do batch pode ser "PN" ou "PN, Fabricante" (ou com ';').
+function parseBatchLine(line){
+  const parts = line.split(/[;,\t]/).map(s => s.trim()).filter((s, i) => i === 0 || s);
+  return { pn: (parts[0] || '').replace(/^"|"$/g, ''), mfr: (parts[1] || '').replace(/^"|"$/g, '') };
+}
+
 function handleBatchFile(event){
   const file = event.target.files[0];
   if(!file) return;
@@ -845,21 +985,22 @@ function handleBatchFile(event){
   const reader = new FileReader();
   reader.onload = function(e){
     try{
-      let pns = [];
+      let lines = [];
       if(file.name.toLowerCase().endsWith('.csv')){
         const text = e.target.result;
-        pns = text.split(/\r?\n/).map(line => line.split(',')[0].trim()).filter(Boolean);
+        lines = rowsToBatchLines(parseDelimited(text, detectDelimiter(text)));
       } else {
+        if(typeof XLSX === 'undefined'){
+          alert('A biblioteca de planilhas (SheetJS) não carregou — pode estar bloqueada pela rede. Salve o arquivo como CSV e carregue de novo.');
+          return;
+        }
         const wb = XLSX.read(e.target.result, { type: 'binary' });
         const sheet = wb.Sheets[wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1 });
-        pns = rows.map(r => (r[0] !== undefined ? String(r[0]).trim() : '')).filter(Boolean);
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1 })
+          .map(r => (r || []).map(c => (c === undefined || c === null ? '' : String(c).trim())));
+        lines = rowsToBatchLines(rows);
       }
-      // remove cabeçalho óbvio se a primeira linha não parecer um PN (ex.: "Part Number", "PN")
-      if(pns.length && /^(part\s*number|pn|mpn|c[oó]digo)$/i.test(pns[0])){
-        pns.shift();
-      }
-      document.getElementById('batchList').value = pns.join('\n');
+      document.getElementById('batchList').value = lines.join('\n');
     }catch(err){
       alert('Não consegui ler o arquivo: ' + err.message);
     }
@@ -872,10 +1013,25 @@ function handleBatchFile(event){
   }
 }
 
+// Intervalo entre chamadas: as APIs de distribuidor têm limite por minuto e uma
+// BOM grande dispararia dezenas de requisições em sequência imediata.
+const BATCH_DELAY_MS = 350;
+let batchCancelled = false;
+let batchRunning = false;
+
+function delay(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+function cancelBatch(){
+  if(!batchRunning) return;
+  batchCancelled = true;
+  document.getElementById('cancelBatchBtn').textContent = 'Cancelando...';
+}
+
 async function runBatchCheck(){
+  if(batchRunning) return;
   const raw = document.getElementById('batchList').value;
-  const pns = raw.split('\n').map(l => l.trim()).filter(Boolean);
-  if(!pns.length){
+  const items = raw.split('\n').map(l => l.trim()).filter(Boolean).map(parseBatchLine).filter(it => it.pn);
+  if(!items.length){
     alert('Cole ou carregue ao menos um part number.');
     return;
   }
@@ -885,24 +1041,34 @@ async function runBatchCheck(){
   const progressLabel = document.getElementById('progressLabel');
   const resultsTable = document.getElementById('batchResultsTable');
   const resultsBody = document.getElementById('batchResultsBody');
+  const runBtn = document.getElementById('runBatchBtn');
+  const cancelBtn = document.getElementById('cancelBatchBtn');
+
+  batchCancelled = false;
+  batchRunning = true;
+  runBtn.disabled = true;
+  cancelBtn.style.display = 'inline-block';
+  cancelBtn.textContent = 'Cancelar';
 
   progressWrap.style.display = 'block';
   resultsTable.style.display = 'table';
   resultsBody.innerHTML = '';
   progressFill.style.width = '0%';
 
-  const entries = await loadLog();
+  let entries = await loadLog();
+  let done = 0;
 
-  for(let i = 0; i < pns.length; i++){
-    const pn = pns[i];
-    progressLabel.textContent = `${i+1} / ${pns.length} — verificando ${pn}...`;
+  for(let i = 0; i < items.length; i++){
+    if(batchCancelled) break;
+    const { pn, mfr } = items[i];
+    progressLabel.textContent = `${i+1} / ${items.length} — verificando ${pn}...`;
 
     const row = document.createElement('tr');
     row.innerHTML = `<td class="pn">${escapeHtml(pn)}</td><td colspan="4" style="color:var(--silk-dim); font-family:var(--mono); font-size:12px;">verificando...</td>`;
     resultsBody.appendChild(row);
 
     try{
-      const result = await checkPartNumberViaAPI(pn, '');
+      const result = await checkPartNumberViaAPI(pn, mfr);
       if(result.sources && result.sources.length){
         result.sources = await validateSources(result.sources);
       }
@@ -920,14 +1086,18 @@ async function runBatchCheck(){
         <td class="pn">${escapeHtml(pn)}</td>
         <td>${statusCell}</td>
         <td><span class="conf ${result.confidence}">${CONF_LABEL[result.confidence] || 'Média'}</span></td>
-        <td>${escapeHtml(result.substitute) || '—'}</td>
-        <td>${sourceUrl ? `<a class="src-link" href="${escapeHtml(sourceUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(sourceName)}${mark}</a>` : '<span style="color:var(--silk-dim);">sem fonte</span>'}</td>
+        <td>${escapeHtml(formatSubstitute(result.substitute, result.substituteSource)) || '—'}</td>
+        <td>${safeUrl(sourceUrl) ? `<a class="src-link" href="${escapeHtml(safeUrl(sourceUrl))}" target="_blank" rel="noopener noreferrer">${escapeHtml(sourceName)}${mark}</a>` : '<span style="color:var(--silk-dim);">sem fonte</span>'}</td>
       `;
 
-      entries.unshift({
+      entries = upsertLogEntry(entries, {
         pn,
+        // Prefere o fabricante que as fontes confirmaram ao que foi digitado:
+        // é ele que identifica a peça de verdade e evita duplicar o registro.
+        mfr: result.manufacturer || mfr,
         status: result.status || 'unknown',
         sub: result.substitute || '',
+        subSource: result.substituteSource || '',
         sourceName,
         sourceUrl,
         sourceReachable: reachable,
@@ -935,17 +1105,29 @@ async function runBatchCheck(){
         verifiedDate: todayStr(),
         notes: result.notes || ''
       });
+      done++;
 
     }catch(err){
       row.innerHTML = `<td class="pn">${escapeHtml(pn)}</td><td colspan="4" style="color:var(--led-red); font-family:var(--mono); font-size:12px;">Erro: ${escapeHtml(err.message)}</td>`;
     }
 
-    progressFill.style.width = `${Math.round(((i+1)/pns.length)*100)}%`;
+    progressFill.style.width = `${Math.round(((i+1)/items.length)*100)}%`;
+
+    // Respira entre chamadas para não estourar o rate limit dos distribuidores.
+    if(i < items.length - 1 && !batchCancelled) await delay(BATCH_DELAY_MS);
   }
 
-  progressLabel.textContent = `Concluído: ${pns.length} / ${pns.length}`;
+  progressLabel.textContent = batchCancelled
+    ? `Cancelado: ${done} de ${items.length} verificados (os já concluídos foram salvos no log).`
+    : `Concluído: ${items.length} / ${items.length}`;
+
   await saveLog(entries);
   renderLog(entries);
+
+  batchRunning = false;
+  batchCancelled = false;
+  document.getElementById('runBatchBtn').disabled = false;
+  document.getElementById('cancelBatchBtn').style.display = 'none';
 }
 
 // ---- Exportar relatório Excel ----
@@ -955,23 +1137,20 @@ function exportLogToExcel(){
       alert('O log está vazio. Verifique ao menos um componente antes de exportar.');
       return;
     }
+    // O SheetJS vem de CDN. Em rede corporativa que bloqueia CDN externo o
+    // botão morreria em silêncio — melhor dizer o que houve e oferecer saída.
+    if(typeof XLSX === 'undefined'){
+      alert('Não consegui gerar o Excel: a biblioteca de planilhas (SheetJS) não carregou, provavelmente bloqueada pela rede.\n\nExportando em CSV, que abre no Excel do mesmo jeito.');
+      exportLogToCSV(entries);
+      return;
+    }
 
-    const rows = entries.map(e => ({
-      'Part Number': e.pn,
-      'Status': STATUS_LABEL[e.status] || e.status,
-      'Confiança': CONF_LABEL[e.confidence] || e.confidence,
-      'Substituto Sugerido': e.sub || '',
-      'Fonte': e.sourceName || '',
-      'URL da Fonte': e.sourceUrl || '',
-      'Fonte Acessível': e.sourceReachable === true ? 'Sim' : (e.sourceReachable === false ? 'NÃO - verificar' : 'N/D'),
-      'Verificado em': e.verifiedDate || '',
-      'Observações': e.notes || ''
-    }));
+    const rows = entries.map(e => buildExportRow(e));
 
     const ws = XLSX.utils.json_to_sheet(rows);
     ws['!cols'] = [
-      { wch: 20 }, { wch: 14 }, { wch: 10 }, { wch: 24 },
-      { wch: 16 }, { wch: 40 }, { wch: 14 }, { wch: 14 }, { wch: 40 }
+      { wch: 20 }, { wch: 22 }, { wch: 14 }, { wch: 10 }, { wch: 24 },
+      { wch: 16 }, { wch: 40 }, { wch: 14 }, { wch: 14 }, { wch: 12 }, { wch: 22 }, { wch: 40 }
     ];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Obsolescência');
@@ -979,6 +1158,45 @@ function exportLogToExcel(){
     const filename = `relatorio_obsolescencia_${todayStr().replace(/\//g,'-')}.xlsx`;
     XLSX.writeFile(wb, filename);
   });
+}
+
+function buildExportRow(e){
+  const idade = daysSince(e.verifiedDate);
+  return {
+    'Part Number': e.pn,
+    'Fabricante': e.mfr || '',
+    'Status': STATUS_LABEL[e.status] || e.status,
+    'Confiança': CONF_LABEL[e.confidence] || e.confidence,
+    'Substituto Sugerido': formatSubstitute(e.sub, e.subSource),
+    'Fonte': e.sourceName || '',
+    'URL da Fonte': e.sourceUrl || '',
+    'Fonte Acessível': e.sourceReachable === true ? 'Sim' : (e.sourceReachable === false ? 'NÃO - verificar' : 'N/D'),
+    'Verificado em': e.verifiedDate || '',
+    'Dias desde a verificação': idade === null ? 'N/D' : idade,
+    'Revalidar?': idade === null ? 'N/D' : (idade > STALE_THRESHOLD_DAYS ? `SIM - dado com ${idade} dias` : 'não'),
+    'Observações': e.notes || ''
+  };
+}
+
+// Saída alternativa quando o SheetJS não está disponível. BOM UTF-8 + ';'
+// para o Excel em pt-BR abrir com acento certo e nas colunas certas.
+function exportLogToCSV(entries){
+  const rows = entries.map(e => buildExportRow(e));
+  const headers = Object.keys(rows[0]);
+  const esc = v => `"${String(v === undefined || v === null ? '' : v).replace(/"/g, '""')}"`;
+  const csv = [headers.map(esc).join(';')]
+    .concat(rows.map(r => headers.map(h => esc(r[h])).join(';')))
+    .join('\r\n');
+
+  const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `relatorio_obsolescencia_${todayStr().replace(/\//g,'-')}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function runSearch(){
@@ -1057,6 +1275,37 @@ async function saveLog(entries){
   memoryLog = entries;
 }
 
+// Chave de identidade de um registro: o mesmo PN de fabricantes diferentes é
+// peça diferente e merece linha própria; o mesmo PN do mesmo fabricante é
+// re-verificação e deve SUBSTITUIR o registro antigo, não empilhar.
+function logKey(pn, mfr){
+  return `${(pn || '').trim().toLowerCase()}|${(mfr || '').trim().toLowerCase()}`;
+}
+
+function upsertLogEntry(entries, entry){
+  const key = logKey(entry.pn, entry.mfr);
+  const kept = entries.filter(e => logKey(e.pn, e.mfr) !== key);
+  kept.unshift(entry);
+  return kept;
+}
+
+// Quantos dias desde a verificação. Um status de lifecycle envelhece: uma peça
+// "Active" checada há 8 meses não é evidência de nada hoje.
+const STALE_THRESHOLD_DAYS = 90;
+
+function parseBrDate(str){
+  const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec((str || '').trim());
+  if(!m) return null;
+  const d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function daysSince(dateStr){
+  const d = parseBrDate(dateStr);
+  if(!d) return null;
+  return Math.max(0, Math.floor((Date.now() - d.getTime()) / 86400000));
+}
+
 function showEnvBanner(){
   if(localStorageOk) return;
   const banner = document.getElementById('envBanner');
@@ -1070,18 +1319,23 @@ function renderLog(entries){
     body.innerHTML = '<tr class="empty-row"><td colspan="8">Nenhum componente registrado ainda.</td></tr>';
     return;
   }
-  body.innerHTML = entries.map((e, i) => `
+  body.innerHTML = entries.map((e, i) => {
+    const href = safeUrl(e.sourceUrl);
+    const idade = daysSince(e.verifiedDate);
+    const stale = idade !== null && idade > STALE_THRESHOLD_DAYS;
+    const dateCell = escapeHtml(e.verifiedDate) || '—';
+    return `
     <tr>
-      <td class="pn">${escapeHtml(e.pn)}</td>
+      <td class="pn">${escapeHtml(e.pn)}${e.mfr ? `<br><span style="color:var(--silk-dim); font-size:11px;">${escapeHtml(e.mfr)}</span>` : ''}</td>
       <td><span class="tag ${e.status}">${STATUS_LABEL[e.status]}</span></td>
       <td><span class="conf ${e.confidence || 'medium'}">${CONF_LABEL[e.confidence || 'medium']}</span></td>
-      <td>${escapeHtml(e.sub) || '—'}</td>
-      <td>${e.sourceUrl ? `<a class="src-link" href="${escapeHtml(e.sourceUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(e.sourceName) || 'ver fonte'}</a>` : (escapeHtml(e.sourceName) || '—')}</td>
-      <td>${escapeHtml(e.verifiedDate) || '—'}</td>
+      <td>${escapeHtml(formatSubstitute(e.sub, e.subSource)) || '—'}</td>
+      <td>${href ? `<a class="src-link" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(e.sourceName) || 'ver fonte'}</a>` : (escapeHtml(e.sourceName) || '—')}</td>
+      <td>${dateCell}${stale ? `<br><span style="color:var(--led-amber); font-family:var(--mono); font-size:11px;" title="Verificado há ${idade} dias — revalide">⚠ ${idade}d</span>` : ''}</td>
       <td>${escapeHtml(e.notes) || '—'}</td>
       <td><button class="del" onclick="removeLogEntry(${i})">remover</button></td>
     </tr>
-  `).join('');
+  `;}).join('');
 }
 
 function escapeHtml(str){
@@ -1089,6 +1343,27 @@ function escapeHtml(str){
   const div = document.createElement('div');
   div.textContent = str;
   return div.innerHTML;
+}
+
+// O substituto vem com o código da fonte, não com MPN de fabricante: a Mouser
+// devolve o código de estoque dela (863-LM317TG). Rotular evita que alguém
+// cole isso numa BOM achando que é part number do fabricante.
+function formatSubstitute(sub, source){
+  if(!sub) return '';
+  return source ? `${sub} (${source} PN)` : sub;
+}
+
+// Só http/https viram link. Um log de auditoria não deve produzir links
+// executáveis (javascript:, data:) a partir de texto colado.
+function safeUrl(url){
+  const raw = (url || '').trim();
+  if(!raw) return '';
+  try{
+    const u = new URL(raw, window.location.href);
+    return (u.protocol === 'http:' || u.protocol === 'https:') ? u.href : '';
+  }catch(e){
+    return '';
+  }
 }
 
 async function addLogEntry(){
@@ -1117,8 +1392,16 @@ async function addLogEntry(){
     return;
   }
 
+  if(!safeUrl(sourceUrl)){
+    errEl.textContent = 'A URL da fonte precisa ser um endereço http:// ou https:// válido.';
+    errEl.style.display = 'block';
+    document.getElementById('logSourceUrl').focus();
+    return;
+  }
+
   const entry = {
     pn,
+    mfr: document.getElementById('mfr').value.trim(),
     status,
     sub: document.getElementById('logSub').value.trim(),
     sourceName: document.getElementById('logSourceName').value.trim(),
@@ -1127,8 +1410,7 @@ async function addLogEntry(){
     verifiedDate: todayStr(),
     notes: document.getElementById('logNotes').value.trim()
   };
-  const entries = await loadLog();
-  entries.unshift(entry);
+  const entries = upsertLogEntry(await loadLog(), entry);
   await saveLog(entries);
   renderLog(entries);
 
