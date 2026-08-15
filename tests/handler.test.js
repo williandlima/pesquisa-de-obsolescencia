@@ -217,6 +217,33 @@ async function invoke({ env, routes, body }) {
       /DigiKey: token HTTP 401.*invalid_client.*Client credentials are invalid/.test(parsed.notes), true);
   }
 
+  console.log("\n== handler: variável de ambiente faltando é nomeada ==");
+  {
+    // Só o secret ausente: a mensagem precisa apontar ELE, não os dois.
+    const { parsed } = await invoke({
+      env: { MOUSER_API_KEY: "k", DIGIKEY_CLIENT_ID: "id" },
+      routes: [["api.mouser.com", () => jsonRes(mouserBody([
+        { ManufacturerPartNumber: "X", Manufacturer: "TI", LifecycleStatus: "Active" }]))]],
+      body: { pn: "X" },
+    });
+    info(`notas: ${parsed.notes.slice(parsed.notes.indexOf("DigiKey"))}`);
+    check("aponta só o DIGIKEY_CLIENT_SECRET",
+      /DigiKey: falta a variável de ambiente DIGIKEY_CLIENT_SECRET no Netlify/.test(parsed.notes), true);
+    check("não cita o CLIENT_ID, que está presente",
+      /DIGIKEY_CLIENT_ID/.test(parsed.notes), false);
+  }
+  {
+    // Nenhum dos dois: aí sim a fonte nem é consultada.
+    const { parsed } = await invoke({
+      env: { MOUSER_API_KEY: "k" },
+      routes: [["api.mouser.com", () => jsonRes(mouserBody([
+        { ManufacturerPartNumber: "X", Manufacturer: "TI", LifecycleStatus: "Active" }]))]],
+      body: { pn: "X" },
+    });
+    check("sem CLIENT_ID a fonte aparece como não configurada",
+      /DigiKey: não configurada/.test(parsed.notes), true);
+  }
+
   console.log("\n== handler: substituto vem identificado pela fonte ==");
   {
     // O SuggestedReplacement da Mouser é o código de estoque dela (863-...),
