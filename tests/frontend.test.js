@@ -40,7 +40,7 @@ function info(m) { console.log(`  info  ${m}`); }
   console.log("\n== 2. 'Usar no log' + gravação ==");
   await page.click("#autoResult .use-btn");
   check("status copiado p/ formulário", await page.inputValue("#logStatus"), "obsolete");
-  check("substituto copiado", await page.inputValue("#logSub"), "LM317AT");
+  check("substituto copiado com rótulo da fonte", await page.inputValue("#logSub"), "LM317AT (Mouser PN)");
   check("URL da fonte copiada", (await page.inputValue("#logSourceUrl")).includes("/fake/mouser"), true);
   await page.click("text=Adicionar ao log");
   await page.waitForTimeout(200);
@@ -123,6 +123,13 @@ function info(m) { console.log(`  info  ${m}`); }
       check("export traz coluna de fabricante", /Fabricante/.test(header), true);
     }
   }
+
+  console.log("\n== 8b. Substituto rotulado como PN da fonte ==");
+  // A linha do LM317T é a que tem substituto; o batch empilha em ordem inversa.
+  const linhaLm = page.locator("#logBody tr").filter({ hasText: "LM317T" }).first();
+  const subCell = (await linhaLm.locator("td").nth(3).textContent()).trim();
+  info(`célula de substituto no log: ${JSON.stringify(subCell)}`);
+  check("log mostra de qual fonte é o código", /\(Mouser PN\)/.test(subCell), true);
 
   console.log("\n== 9. XSS / sanitização ==");
   await page.evaluate(() => localStorage.setItem("obsolescence-log", JSON.stringify([{

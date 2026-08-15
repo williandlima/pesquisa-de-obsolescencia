@@ -217,6 +217,30 @@ async function invoke({ env, routes, body }) {
       /DigiKey: token HTTP 401.*invalid_client.*Client credentials are invalid/.test(parsed.notes), true);
   }
 
+  console.log("\n== handler: substituto vem identificado pela fonte ==");
+  {
+    // O SuggestedReplacement da Mouser é o código de estoque dela (863-...),
+    // não um MPN — o resultado precisa dizer de onde veio para não virar BOM.
+    const { parsed } = await invoke({
+      env: { MOUSER_API_KEY: "k" },
+      routes: [["api.mouser.com", () => jsonRes(mouserBody([
+        { ManufacturerPartNumber: "LM317T", Manufacturer: "onsemi", LifecycleStatus: "Obsolete",
+          SuggestedReplacement: "863-LM317TG" }]))]],
+      body: { pn: "LM317T" },
+    });
+    check("substituto preservado cru", parsed.substitute, "863-LM317TG");
+    check("fonte do substituto identificada", parsed.substituteSource, "Mouser");
+  }
+  {
+    const { parsed } = await invoke({
+      env: { MOUSER_API_KEY: "k" },
+      routes: [["api.mouser.com", () => jsonRes(mouserBody([
+        { ManufacturerPartNumber: "X", Manufacturer: "TI", LifecycleStatus: "Active" }]))]],
+      body: { pn: "X" },
+    });
+    check("sem substituto, sem fonte de substituto", [parsed.substitute, parsed.substituteSource], ["", ""]);
+  }
+
   console.log("\n== handler: lead time zerado não é anunciado ==");
   {
     const { parsed } = await invoke({

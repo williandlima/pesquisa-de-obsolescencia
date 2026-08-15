@@ -879,7 +879,7 @@ function renderAutoResult(pn, result){
   autoResultEl.innerHTML = `
     <div class="auto-result">
       <div class="aline"><span class="alabel">Status:</span> <span class="tag ${result.status}">${STATUS_LABEL[result.status] || 'Não conclusivo'}</span> <span class="conf ${result.confidence}">${CONF_LABEL[result.confidence] || 'Média'}</span></div>
-      ${result.substitute ? `<div class="aline"><span class="alabel">Substituto sugerido:</span> ${escapeHtml(result.substitute)}</div>` : ''}
+      ${result.substitute ? `<div class="aline"><span class="alabel">Substituto sugerido:</span> ${escapeHtml(formatSubstitute(result.substitute, result.substituteSource))}</div>` : ''}
       <div class="aline"><span class="alabel">Notas:</span> ${escapeHtml(result.notes || '')}</div>
       ${warnMfr}
       ${warnUnknown}
@@ -895,7 +895,7 @@ function fillLogFromAuto(){
   if(!result) return;
   document.getElementById('logStatus').value = result.status || 'unknown';
   document.getElementById('logConfidence').value = result.confidence || 'medium';
-  document.getElementById('logSub').value = result.substitute || '';
+  document.getElementById('logSub').value = formatSubstitute(result.substitute, result.substituteSource);
   document.getElementById('logNotes').value = result.notes || '';
   // Mostra qual fabricante as fontes casaram, para o registro ficar identificado.
   const mfrField = document.getElementById('mfr');
@@ -1086,7 +1086,7 @@ async function runBatchCheck(){
         <td class="pn">${escapeHtml(pn)}</td>
         <td>${statusCell}</td>
         <td><span class="conf ${result.confidence}">${CONF_LABEL[result.confidence] || 'Média'}</span></td>
-        <td>${escapeHtml(result.substitute) || '—'}</td>
+        <td>${escapeHtml(formatSubstitute(result.substitute, result.substituteSource)) || '—'}</td>
         <td>${safeUrl(sourceUrl) ? `<a class="src-link" href="${escapeHtml(safeUrl(sourceUrl))}" target="_blank" rel="noopener noreferrer">${escapeHtml(sourceName)}${mark}</a>` : '<span style="color:var(--silk-dim);">sem fonte</span>'}</td>
       `;
 
@@ -1097,6 +1097,7 @@ async function runBatchCheck(){
         mfr: result.manufacturer || mfr,
         status: result.status || 'unknown',
         sub: result.substitute || '',
+        subSource: result.substituteSource || '',
         sourceName,
         sourceUrl,
         sourceReachable: reachable,
@@ -1166,7 +1167,7 @@ function buildExportRow(e){
     'Fabricante': e.mfr || '',
     'Status': STATUS_LABEL[e.status] || e.status,
     'Confiança': CONF_LABEL[e.confidence] || e.confidence,
-    'Substituto Sugerido': e.sub || '',
+    'Substituto Sugerido': formatSubstitute(e.sub, e.subSource),
     'Fonte': e.sourceName || '',
     'URL da Fonte': e.sourceUrl || '',
     'Fonte Acessível': e.sourceReachable === true ? 'Sim' : (e.sourceReachable === false ? 'NÃO - verificar' : 'N/D'),
@@ -1328,7 +1329,7 @@ function renderLog(entries){
       <td class="pn">${escapeHtml(e.pn)}${e.mfr ? `<br><span style="color:var(--silk-dim); font-size:11px;">${escapeHtml(e.mfr)}</span>` : ''}</td>
       <td><span class="tag ${e.status}">${STATUS_LABEL[e.status]}</span></td>
       <td><span class="conf ${e.confidence || 'medium'}">${CONF_LABEL[e.confidence || 'medium']}</span></td>
-      <td>${escapeHtml(e.sub) || '—'}</td>
+      <td>${escapeHtml(formatSubstitute(e.sub, e.subSource)) || '—'}</td>
       <td>${href ? `<a class="src-link" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(e.sourceName) || 'ver fonte'}</a>` : (escapeHtml(e.sourceName) || '—')}</td>
       <td>${dateCell}${stale ? `<br><span style="color:var(--led-amber); font-family:var(--mono); font-size:11px;" title="Verificado há ${idade} dias — revalide">⚠ ${idade}d</span>` : ''}</td>
       <td>${escapeHtml(e.notes) || '—'}</td>
@@ -1342,6 +1343,14 @@ function escapeHtml(str){
   const div = document.createElement('div');
   div.textContent = str;
   return div.innerHTML;
+}
+
+// O substituto vem com o código da fonte, não com MPN de fabricante: a Mouser
+// devolve o código de estoque dela (863-LM317TG). Rotular evita que alguém
+// cole isso numa BOM achando que é part number do fabricante.
+function formatSubstitute(sub, source){
+  if(!sub) return '';
+  return source ? `${sub} (${source} PN)` : sub;
 }
 
 // Só http/https viram link. Um log de auditoria não deve produzir links

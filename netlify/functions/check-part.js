@@ -673,7 +673,12 @@ exports.handler = async (event) => {
     }
 
     const combined = combine(results);
-    const substitute = results.find((r) => r.substitute)?.substitute || "";
+    // Guarda de qual fonte veio o substituto. O SuggestedReplacement da Mouser é
+    // o código de estoque DELA (ex.: 863-LM317TG), não um MPN de fabricante —
+    // sem rótulo, alguém colaria isso numa BOM achando que é part number.
+    const subResult = results.find((r) => r.substitute);
+    const substitute = subResult ? subResult.substitute : "";
+    const substituteSource = subResult ? subResult.source : "";
     const manufacturer = results.find((r) => r.manufacturer)?.manufacturer || "";
     // Lead time zerado é o valor default do catálogo quando não há prazo, não um
     // prazo de zero dia — anunciá-lo numa peça obsoleta induz ao erro.
@@ -709,6 +714,7 @@ exports.handler = async (event) => {
         status: combined.status,
         confidence: combined.confidence,
         substitute,
+        substituteSource,
         manufacturer,
         notes,
         sources: sources.slice(0, 5),

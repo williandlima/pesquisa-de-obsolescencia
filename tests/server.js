@@ -8,7 +8,7 @@ const PUBLIC = require("path").resolve(__dirname, "../public");
 const requests = [];
 
 const FIXTURES = {
-  LM317T: { status: "obsolete", confidence: "high", substitute: "LM317AT", manufacturer: "Texas Instruments",
+  LM317T: { status: "obsolete", confidence: "high", substitute: "LM317AT", substituteSource: "Mouser", manufacturer: "Texas Instruments",
     notes: 'Lifecycle: "obsolete" — Texas Instruments — 2 fontes independentes concordam.',
     sources: [{ name: "Mouser", url: "http://127.0.0.1:{PORT}/fake/mouser" }] },
   STM32F103C8T6: { status: "active", confidence: "high", substitute: "", manufacturer: "STMicroelectronics",
