@@ -1,5 +1,7 @@
 # Rastreador de Obsolescência de Componentes
 
+[![Testes](https://github.com/williandlima/pesquisa-de-obsolescencia/actions/workflows/test.yml/badge.svg)](https://github.com/williandlima/pesquisa-de-obsolescencia/actions/workflows/test.yml)
+
 App web para verificar o status de lifecycle (Active / NRND / Obsolete) de componentes
 eletrônicos, cruzando **múltiplas fontes de distribuidor autorizado**, com verificação
 individual e em lista, log auditável e exportação de relatório em Excel.
@@ -86,14 +88,27 @@ netlify deploy --prod
 ## Testes
 
 ```bash
-node tests/run.js
+npm test               # tudo
+npm run test:backend   # só backend — zero dependências
+npm run test:frontend  # só frontend — precisa de `npm install` antes (Playwright)
 ```
 
-Não precisa instalar nada para os testes de backend. Os testes de frontend precisam do
-Playwright e são pulados automaticamente se ele não estiver disponível.
+Os testes de backend não exigem nada instalado. Os de frontend precisam do Playwright
+(`npm install` traz como devDependency) e são pulados automaticamente se ele não estiver
+disponível. Todo push e PR roda a suíte inteira via GitHub Actions
+(`.github/workflows/test.yml`).
 
 ## Segurança
 
 - Credenciais nunca vão ao navegador — ficam só nas variáveis de ambiente do Netlify.
-- O log fica no `localStorage` do navegador de cada usuário (não há banco central).
+- O log fica no `localStorage` do navegador de cada usuário (não há banco central,
+  então também não há como recuperar o log se o navegador for trocado ou o
+  armazenamento local for limpo — exporte para Excel com frequência).
 - Apenas URLs `http`/`https` viram links clicáveis no log.
+- `Access-Control-Allow-Origin` da função é travado no domínio do app — outros sites
+  não conseguem usar o navegador de um visitante para chamar `/api/check-part` e
+  consumir a cota das APIs pagas. Isso não impede chamada direta via curl/script
+  (CORS é imposto pelo navegador, não pelo servidor); não há rate limiting real hoje.
+- Erros inesperados de cada fonte e do handler vão para os logs da função no Netlify
+  (`console.error`), prefixados com `[check-part]`, para diagnóstico sem precisar
+  reproduzir o problema localmente.

@@ -249,6 +249,7 @@ async function queryMouser(pn, mfr) {
     if (!results.length) return { results: [], debug: "encontrado, mas sem campo de lifecycle preenchido" };
     return { results, debug: "ok" };
   } catch (e) {
+    console.error(`[check-part] Mouser falhou para "${pn}":`, e.message);
     return { results: [], debug: `erro: ${e.message}` };
   }
 }
@@ -329,6 +330,7 @@ async function queryFarnell(pn, mfr) {
     if (!results.length) return { results: [], debug: "encontrado, mas sem status reconhecível" };
     return { results, debug: "ok" };
   } catch (e) {
+    console.error(`[check-part] Farnell falhou para "${pn}":`, e.message);
     return { results: [], debug: `erro: ${e.message}` };
   }
 }
@@ -430,6 +432,7 @@ async function queryTrustedParts(pn, mfr) {
     if (!results.length) return { results: [], debug: "encontrado, mas sem status nem estoque autorizado" };
     return { results, debug: "ok" };
   } catch (e) {
+    console.error(`[check-part] TrustedParts falhou para "${pn}":`, e.message);
     return { results: [], debug: `erro: ${e.message}` };
   }
 }
@@ -580,6 +583,7 @@ async function queryDigiKey(pn, mfr) {
     if (!results.length) return { results: [], debug: "encontrado, mas sem campo de status preenchido" };
     return { results, debug: "ok" };
   } catch (e) {
+    console.error(`[check-part] Digi-Key falhou para "${pn}":`, e.message);
     return { results: [], debug: `erro: ${e.message}` };
   }
 }
@@ -729,9 +733,16 @@ function compareCandidates(a, b) {
   return 0;
 }
 
+// "*" deixava qualquer site do mundo chamar esta função pelo navegador de
+// quem estivesse com a página aberta — e cada chamada bate em APIs pagas com
+// cota limitada (Mouser/Farnell/Digi-Key/TrustedParts). Travar no domínio do
+// app não impede chamada direta via curl/script (CORS é aplicado pelo
+// navegador, não pelo servidor), mas fecha o vetor de abuso via browser.
+const ALLOWED_ORIGIN = "https://obscomp2026.netlify.app";
+
 exports.handler = async (event) => {
   const cors = {
-    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
     "Access-Control-Allow-Headers": "Content-Type",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Content-Type": "application/json",
@@ -832,6 +843,7 @@ exports.handler = async (event) => {
       }),
     };
   } catch (err) {
+    console.error(`[check-part] Erro interno inesperado para "${trimmedPn}":`, err.stack || err.message);
     return { statusCode: 500, headers: cors, body: JSON.stringify({ error: err.message || "Erro interno" }) };
   }
 };

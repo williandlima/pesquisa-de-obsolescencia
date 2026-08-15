@@ -496,8 +496,8 @@
       </div>
 
       <div class="results" id="results">
-        <div class="status-strip">
-          <span class="led unknown" id="statusLed"></span>
+        <div class="status-strip" role="status" aria-live="polite">
+          <span class="led unknown" id="statusLed" aria-hidden="true"></span>
           <span id="statusText">Status desconhecido — nenhuma fonte foi consultada automaticamente. Abra os links abaixo e registre o que encontrar no log.</span>
         </div>
         <div class="source-grid" id="sourceGrid"></div>
@@ -527,7 +527,7 @@
 
       <div class="progress-wrap" id="progressWrap">
         <div class="progress-bar-bg"><div class="progress-bar-fill" id="progressFill"></div></div>
-        <div class="progress-label" id="progressLabel">0 / 0</div>
+        <div class="progress-label" id="progressLabel" role="status" aria-live="polite">0 / 0</div>
       </div>
 
       <div class="batch-results-table">
@@ -594,7 +594,7 @@
         </div>
       </div>
       <button class="btn-secondary" onclick="addLogEntry()">Adicionar ao log</button>
-      <p id="formError" style="display:none; color:var(--led-red); font-family:var(--mono); font-size:12px; margin:10px 0 0;"></p>
+      <p id="formError" role="alert" style="display:none; color:var(--led-red); font-family:var(--mono); font-size:12px; margin:10px 0 0;"></p>
 
       <table>
         <thead>

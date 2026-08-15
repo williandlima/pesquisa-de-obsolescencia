@@ -1,0 +1,8 @@
+node_modules/
+.netlify/
+.env
+.env.*
+!.env.example
+*.log
+tests/out_*.csv
+tests/out_*.xlsx
