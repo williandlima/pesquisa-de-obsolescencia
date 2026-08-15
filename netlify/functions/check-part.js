@@ -391,7 +391,17 @@ async function getDigiKeyToken() {
 
   const clientId = process.env.DIGIKEY_CLIENT_ID;
   const clientSecret = process.env.DIGIKEY_CLIENT_SECRET;
-  if (!clientId || !clientSecret) return { error: "faltam DIGIKEY_CLIENT_ID/DIGIKEY_CLIENT_SECRET" };
+  // Nomear exatamente a variável que falta: dizer "faltam A/B" quando só B
+  // falta manda o usuário procurar no lugar errado.
+  const missing = [
+    !clientId && "DIGIKEY_CLIENT_ID",
+    !clientSecret && "DIGIKEY_CLIENT_SECRET",
+  ].filter(Boolean);
+  if (missing.length) {
+    return {
+      error: `falta a variável de ambiente ${missing.join(" e ")} no Netlify (defina e refaça o deploy)`,
+    };
+  }
 
   const body = new URLSearchParams({
     grant_type: "client_credentials",
