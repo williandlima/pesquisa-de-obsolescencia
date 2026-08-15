@@ -9,7 +9,7 @@ const path = require("path");
 
 const SUITES = {
   backend: ["backend.test.js", "handler.test.js"],
-  frontend: ["frontend.test.js", "frontend2.test.js"],
+  frontend: ["frontend.test.js", "frontend2.test.js", "frontend3.test.js"],
 };
 
 const which = (process.argv[2] || "all").toLowerCase();

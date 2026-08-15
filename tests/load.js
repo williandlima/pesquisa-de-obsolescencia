@@ -8,7 +8,7 @@ const SRC = path.resolve(__dirname, "../netlify/functions/check-part.js");
 
 function loadFunction({ env = {}, fetchImpl } = {}) {
   const code = fs.readFileSync(SRC, "utf8") +
-    "\n;__internals = { normalizeStatus, combine, manufacturerMatches, queryMouser, queryFarnell, queryTrustedParts, queryDigiKey, handler: exports.handler };";
+    "\n;__internals = { normalizeStatus, combine, manufacturerMatches, manufacturersEqual, pickManufacturerCandidates, groupByManufacturer, buildCandidate, compareCandidates, queryMouser, queryFarnell, queryTrustedParts, queryDigiKey, handler: exports.handler };";
 
   const sandbox = {
     process: { env: { ...env } },

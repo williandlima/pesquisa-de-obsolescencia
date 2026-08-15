@@ -195,6 +195,17 @@
     text-decoration:none; color:var(--silk);
   }
   .auto-sources a:hover{border-color:var(--copper-bright); color:var(--copper-bright);}
+  .mfr-candidates{display:flex; flex-wrap:wrap; gap:6px; margin-top:6px;}
+  .mfr-chip{
+    display:flex; align-items:center; gap:6px;
+    font-family:var(--sans); font-size:12px; font-weight:500;
+    background:transparent; color:var(--silk);
+    border:1px solid rgba(207,216,210,0.25);
+    padding:5px 10px; border-radius:4px;
+    cursor:pointer; transition:border-color .15s, background .15s;
+  }
+  .mfr-chip:hover{border-color:var(--copper-bright);}
+  .mfr-chip.active{border-color:var(--copper-bright); background:rgba(193,127,74,0.12);}
   .use-btn{
     margin-top:10px;
     background:var(--copper); color:#1a1006;
@@ -847,19 +858,35 @@ async function autoCheck(){
 }
 
 let lastAutoResult = null;
+let lastCheckedPn = '';
+let lastSelectedCandidateIndex = 0;
 
-function renderAutoResult(pn, result){
+// Quando o PN é feito por mais de um fabricante, o backend devolve `candidates`
+// — um item por fabricante, já votado e com confiança própria. `result` (nível
+// raiz) é sempre o candidato de maior confiança; os outros ficam disponíveis
+// para o usuário trocar sem precisar verificar de novo.
+function activeCandidate(result, idx){
+  if(result.candidates && result.candidates[idx]) return result.candidates[idx];
+  return result;
+}
+
+function renderAutoResult(pn, result, selectedIndex){
   lastAutoResult = result;
+  lastCheckedPn = pn;
+  lastSelectedCandidateIndex = selectedIndex || 0;
+  const data = activeCandidate(result, lastSelectedCandidateIndex);
+
   const led = document.getElementById('statusLed');
   const statusText = document.getElementById('statusText');
   const autoResultEl = document.getElementById('autoResult');
 
   const ledClassMap = { active: 'green', nrnd: 'amber', obsolete: 'red', unknown: 'unknown' };
-  led.className = 'led ' + (ledClassMap[result.status] || 'unknown');
-  statusText.textContent = `Resultado automático para "${pn}": ${STATUS_LABEL[result.status] || 'Não conclusivo'} (confiança ${CONF_LABEL[result.confidence] || 'Média'}).`;
+  led.className = 'led ' + (ledClassMap[data.status] || 'unknown');
+  const mfrSuffix = data.manufacturer ? ` (${data.manufacturer})` : '';
+  statusText.textContent = `Resultado automático para "${pn}"${mfrSuffix}: ${STATUS_LABEL[data.status] || 'Não conclusivo'} (confiança ${CONF_LABEL[data.confidence] || 'Média'}).`;
 
-  const sourcesHtml = (result.sources || []).length
-    ? (result.sources || []).map(s => {
+  const sourcesHtml = (data.sources || []).length
+    ? (data.sources || []).map(s => {
         const mark = (s.reachable === false) ? ' ⚠' : (s.reachable === true ? ' ✓' : '');
         const title = (s.reachable === false) ? 'Link pode estar inacessível — confirme manualmente' : '';
         const href = safeUrl(s.url);
@@ -868,41 +895,56 @@ function renderAutoResult(pn, result){
       }).join('')
     : '<span style="color:var(--silk-dim); font-size:12px;">Nenhuma fonte confirmada — verificação manual necessária.</span>';
 
-  const warnUnknown = result.status === 'unknown'
+  const warnUnknown = data.status === 'unknown'
     ? `<div class="aline" style="color:var(--led-amber);">⚠ Status não confirmado automaticamente. Use os links de busca manual e confirme antes de registrar.</div>`
     : '';
 
-  const warnMfr = result.mfrConflict
-    ? `<div class="aline" style="color:var(--led-amber);">⚠ As fontes responderam por <strong>fabricantes diferentes</strong> para este PN — a concordância entre elas não confirma que é a mesma peça. Preencha o campo Fabricante e verifique de novo.</div>`
+  const candidatesHtml = (result.candidates && result.candidates.length > 1)
+    ? `
+      <div class="aline"><span class="alabel">Este PN também é feito por:</span></div>
+      <div class="mfr-candidates">${result.candidates.map((c, i) => `
+        <button type="button" class="mfr-chip ${i === lastSelectedCandidateIndex ? 'active' : ''}" onclick="selectManufacturerCandidate(${i})">
+          ${escapeHtml(c.manufacturer || 'Fabricante não identificado')}
+          <span class="tag ${c.status}">${STATUS_LABEL[c.status] || 'Não conclusivo'}</span>
+        </button>`).join('')}</div>
+      <div class="aline" style="font-size:11.5px; color:var(--silk-dim);">Clique num fabricante para ver os detalhes dele. O casamento é aproximado — confirme antes de usar no log.</div>
+    `
     : '';
 
   autoResultEl.innerHTML = `
     <div class="auto-result">
-      <div class="aline"><span class="alabel">Status:</span> <span class="tag ${result.status}">${STATUS_LABEL[result.status] || 'Não conclusivo'}</span> <span class="conf ${result.confidence}">${CONF_LABEL[result.confidence] || 'Média'}</span></div>
-      ${result.substitute ? `<div class="aline"><span class="alabel">Substituto sugerido:</span> ${escapeHtml(formatSubstitute(result.substitute, result.substituteSource))}</div>` : ''}
-      <div class="aline"><span class="alabel">Notas:</span> ${escapeHtml(result.notes || '')}</div>
-      ${warnMfr}
+      <div class="aline"><span class="alabel">Status:</span> <span class="tag ${data.status}">${STATUS_LABEL[data.status] || 'Não conclusivo'}</span> <span class="conf ${data.confidence}">${CONF_LABEL[data.confidence] || 'Média'}</span>${data.manufacturer ? ` <span style="color:var(--silk-dim); font-size:12px;">— ${escapeHtml(data.manufacturer)}</span>` : ''}</div>
+      ${data.substitute ? `<div class="aline"><span class="alabel">Substituto sugerido:</span> ${escapeHtml(formatSubstitute(data.substitute, data.substituteSource))}</div>` : ''}
+      <div class="aline"><span class="alabel">Notas:</span> ${escapeHtml(data.notes || '')}</div>
       ${warnUnknown}
       <div class="aline"><span class="alabel">Fontes efetivamente consultadas na busca:</span></div>
       <div class="auto-sources">${sourcesHtml}</div>
+      ${candidatesHtml}
       <button class="use-btn" onclick="fillLogFromAuto()">Usar no log</button>
     </div>
   `;
 }
 
+function selectManufacturerCandidate(idx){
+  if(!lastAutoResult) return;
+  renderAutoResult(lastCheckedPn, lastAutoResult, idx);
+}
+
 function fillLogFromAuto(){
   const result = lastAutoResult;
   if(!result) return;
-  document.getElementById('logStatus').value = result.status || 'unknown';
-  document.getElementById('logConfidence').value = result.confidence || 'medium';
-  document.getElementById('logSub').value = formatSubstitute(result.substitute, result.substituteSource);
-  document.getElementById('logNotes').value = result.notes || '';
-  // Mostra qual fabricante as fontes casaram, para o registro ficar identificado.
+  const data = activeCandidate(result, lastSelectedCandidateIndex);
+  document.getElementById('logStatus').value = data.status || 'unknown';
+  document.getElementById('logConfidence').value = data.confidence || 'medium';
+  document.getElementById('logSub').value = formatSubstitute(data.substitute, data.substituteSource);
+  document.getElementById('logNotes').value = data.notes || '';
+  // Mostra qual fabricante as fontes casaram, para o registro ficar identificado
+  // — importante sobretudo quando havia mais de um candidato e o usuário trocou.
   const mfrField = document.getElementById('mfr');
-  if(!mfrField.value.trim() && result.manufacturer) mfrField.value = result.manufacturer;
-  if(result.sources && result.sources[0]){
-    document.getElementById('logSourceUrl').value = result.sources[0].url || '';
-    document.getElementById('logSourceName').value = result.sources[0].name || '';
+  if(data.manufacturer) mfrField.value = data.manufacturer;
+  if(data.sources && data.sources[0]){
+    document.getElementById('logSourceUrl').value = data.sources[0].url || '';
+    document.getElementById('logSourceName').value = data.sources[0].name || '';
   }
   document.getElementById('logPn').scrollIntoView({behavior:'smooth', block:'center'});
 }

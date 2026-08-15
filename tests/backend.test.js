@@ -11,7 +11,10 @@ function check(name, actual, expected) {
 
 // ---------------------------------------------------------------
 console.log("\n== normalizeStatus: rótulos reais dos distribuidores ==");
-const { normalizeStatus, combine, manufacturerMatches } = loadFunction();
+const {
+  normalizeStatus, combine, manufacturerMatches, manufacturersEqual,
+  pickManufacturerCandidates, groupByManufacturer, buildCandidate, compareCandidates,
+} = loadFunction();
 
 // Mouser LifecycleStatus reais
 check("Mouser 'Active'", normalizeStatus("Active"), "active");
@@ -64,13 +67,17 @@ check("nenhuma conclusiva => unknown/low",
 check("estoque autorizado sem status => low + nota",
   combine([{ source: "TrustedParts", status: "unknown", authorizedStock: true }]).confidence, "low");
 
-// PROBLEMA A INVESTIGAR: 2 fontes concordam mas são de FABRICANTES DIFERENTES
-const crossMfr = combine([
+// combine() agora assume que quem chama já garantiu que os itens são do MESMO
+// fabricante (o agrupamento acontece antes, no handler) — por isso não olha
+// mais o campo manufacturer. 2 fontes concordando é confiança alta mesmo que
+// os itens carreguem fabricantes diferentes: não é bug, é contrato do jeito
+// que agora as fontes SEMPRE chegam já agrupadas por fabricante.
+const sameGroupDifferentMfrField = combine([
   { source: "Mouser", status: "active", manufacturer: "Texas Instruments" },
   { source: "DigiKey", status: "active", manufacturer: "onsemi" },
 ]);
-check("2 fabricantes DIFERENTES não deveriam dar confiança alta",
-  crossMfr.confidence, "medium");
+check("combine() não filtra por fabricante — isso é papel do agrupamento upstream",
+  sameGroupDifferentMfrField.confidence, "high");
 
 // PROBLEMA: maioria 2x1 é tratada como divergência total
 const majority = combine([
@@ -79,6 +86,51 @@ const majority = combine([
   { source: "Farnell/element14", status: "active" },
 ]);
 console.log(`  info  maioria 2x1 (2 obsolete, 1 active) => status="${majority.status}" conf="${majority.confidence}"`);
+
+// ---------------------------------------------------------------
+console.log("\n== manufacturersEqual: igualdade para AGRUPAR (não para filtrar) ==");
+check("ambos vazios agrupam juntos", manufacturersEqual("", ""), true);
+check("um vazio um não NÃO agrupa (diferente de manufacturerMatches!)", manufacturersEqual("", "Texas Instruments"), false);
+check("substring das duas pontas", manufacturersEqual("STMicroelectronics", "ST"), true);
+check("fabricantes de fato diferentes", manufacturersEqual("Texas Instruments", "onsemi"), false);
+check("case-insensitive", manufacturersEqual("OnSemi", "onsemi"), true);
+
+// ---------------------------------------------------------------
+console.log("\n== pickManufacturerCandidates: separa fabricantes em vez de escolher 1 ==");
+const rawItems = [
+  { mfr: "Texas Instruments", hasStatus: true },
+  { mfr: "onsemi", hasStatus: true },
+  { mfr: "onsemi", hasStatus: false }, // duplicata do mesmo fabricante — deve virar 1 candidato só
+  { mfr: "STMicroelectronics", hasStatus: false },
+];
+const picks = pickManufacturerCandidates(rawItems, {
+  getMfr: (it) => it.mfr,
+  hasStatus: (it) => it.hasStatus,
+  mfr: "",
+});
+check("3 fabricantes distintos viram 3 candidatos (não 4 itens)", picks.length, 3);
+check("dentro do grupo onsemi, prefere o item com status preenchido",
+  picks.find((p) => p.mfr === "onsemi").hasStatus, true);
+
+console.log("\n== pickManufacturerCandidates: filtro por fabricante é 'soft' ==");
+const filteredToTI = pickManufacturerCandidates(rawItems, {
+  getMfr: (it) => it.mfr, hasStatus: (it) => it.hasStatus, mfr: "Texas Instruments",
+});
+check("mfr bate com algo => só esse fabricante", filteredToTI.map((p) => p.mfr), ["Texas Instruments"]);
+const filteredToNothing = pickManufacturerCandidates(rawItems, {
+  getMfr: (it) => it.mfr, hasStatus: (it) => it.hasStatus, mfr: "Microchip",
+});
+check("mfr não bate em nada => mostra todos em vez de falhar", filteredToNothing.length, 3);
+
+console.log("\n== compareCandidates: ranking de confiança ==");
+const ranked = [
+  { confidence: "medium", agreeing: 1, sourceCount: 1, manufacturer: "onsemi" },
+  { confidence: "high", agreeing: 2, sourceCount: 2, manufacturer: "Texas Instruments" },
+  { confidence: "medium", agreeing: 1, sourceCount: 1, manufacturer: "" },
+].sort(compareCandidates);
+check("confiança alta vem primeiro", ranked[0].manufacturer, "Texas Instruments");
+check("em empate de confiança, fabricante nomeado vem antes do não identificado",
+  ranked[1].manufacturer, "onsemi");
 
 console.log(`\n----- normalize/combine: ${pass} ok, ${fail} falhas -----`);
 module.exports = { pass, fail, fails };
