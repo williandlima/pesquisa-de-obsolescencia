@@ -34,20 +34,27 @@ nas notas do resultado entre colchetes.
   próprio (a função da Netlify é morta em ~10s, então uma fonte pendurada não pode
   travar as outras).
 - Cada fonte normaliza o rótulo do distribuidor para `active` / `nrnd` / `obsolete` / `unknown`.
-- **Confiança**: 2+ fontes conclusivas concordando → `alta`; fonte única → `média`;
-  nenhuma conclusiva → `baixa`.
-- **Divergência** entre fontes conclusivas força `não conclusivo` — o app não escolhe
-  arbitrariamente entre respostas contraditórias.
-- **Fabricantes diferentes não se corroboram**: se duas fontes dizem "active" mas para
-  fabricantes distintos, a confiança cai para `média` e o resultado avisa. O mesmo PN
-  existe em vários fabricantes com lifecycles diferentes (LM317T da TI, onsemi, ST).
+- **Sem fabricante informado, cada fonte pode devolver mais de um fabricante** para o
+  mesmo PN (o mesmo part number existe em vários fabricantes, com lifecycles distintos
+  — ex.: LM317T da TI, da onsemi, da ST). O backend agrupa os resultados das 4 fontes
+  por fabricante ANTES de votar, então cada fabricante recebe a confiança que realmente
+  merece, em vez de o app escolher um arbitrariamente ou diluir a confiança de todos.
+- **Confiança**, calculada por grupo de fabricante: 2+ fontes conclusivas concordando
+  sobre o mesmo fabricante → `alta`; fonte única → `média`; nenhuma conclusiva → `baixa`.
+- **Divergência** entre fontes conclusivas sobre o mesmo fabricante força `não
+  conclusivo` — o app não escolhe arbitrariamente entre respostas contraditórias.
+- Quando há mais de um fabricante candidato, a resposta traz um array `candidates`
+  (um por fabricante, já ordenado por confiança) além dos campos de nível raiz, que
+  refletem sempre o candidato de maior confiança. O frontend mostra os demais como
+  chips clicáveis, sem precisar de nova chamada à API.
 
 ## Regras de confiabilidade (não remover sem motivo)
 
 1. **Nunca inventar status sem fonte confirmada** — sem dado conclusivo, o status é
    `não conclusivo`, nunca um palpite.
 2. **Casamento PN + fabricante** — quando o fabricante é informado, todas as fontes
-   filtram por ele.
+   filtram por ele (filtro "soft": se nada bater, mostra os candidatos encontrados em
+   vez de falhar silenciosamente).
 3. **Degradação graciosa** — qualquer fonte pode falhar sem quebrar o fluxo.
 4. **URL da fonte é obrigatória no log manual** — registro sem link auditável não é aceito.
 5. **Dado de lifecycle envelhece** — registros com mais de 90 dias

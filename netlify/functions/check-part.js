@@ -1,4 +1,4 @@
-// Netlify Function: check-part  (v5)
+// Netlify Function: check-part  (v6)
 // Consulta QUATRO fontes independentes e cruza os resultados:
 //   1. Mouser (distribuidor autorizado)
 //   2. Farnell/element14/Newark (distribuidor autorizado)
@@ -6,10 +6,15 @@
 //   4. Digi-Key (maior catálogo)
 //
 // Confiabilidade:
-//   - Score de confiança ponderado por número de fontes que concordam.
-//   - Casamento rigoroso por PN + fabricante (quando o fabricante é informado).
-//   - Concordância entre fabricantes DIFERENTES não vira confiança alta: o mesmo
-//     PN existe em vários fabricantes com lifecycles distintos.
+//   - Cada fonte pode devolver MAIS DE UM fabricante para o mesmo PN (quando o
+//     usuário não informa fabricante). Em vez de escolher um arbitrariamente,
+//     agrupamos por fabricante ENTRE as 4 fontes e votamos dentro de cada grupo
+//     — assim "TI: active (2 fontes concordam)" e "onsemi: obsolete (1 fonte)"
+//     aparecem como candidatos separados, cada um com a confiança que merece.
+//   - Score de confiança ponderado por número de fontes que concordam DENTRO
+//     do mesmo grupo de fabricante.
+//   - Casamento por PN + fabricante quando o usuário informa o fabricante (filtro
+//     é "soft": se nada bater, mostra os candidatos encontrados em vez de falhar).
 //   - Degradação graciosa: qualquer fonte pode falhar sem derrubar as outras, e
 //     cada uma tem orçamento de tempo próprio (a função morre em ~10s).
 //
@@ -33,6 +38,11 @@ const SOURCE_WEIGHT = {
   TrustedParts: 2,
   DigiKey: 2,
 };
+
+// Quantos fabricantes distintos mostrar, por fonte e no total. Sem teto, um PN
+// genérico (ex.: um transistor 2N2222 clonado por dezenas de fabricantes)
+// inundaria a resposta.
+const MAX_MANUFACTURER_CANDIDATES = 5;
 
 function normalizeStatus(raw) {
   if (!raw) return "unknown";
@@ -134,6 +144,7 @@ async function readJson(res) {
 }
 
 // Verifica se o fabricante retornado casa com o que o usuário pediu (se pediu).
+// Filtro "soft": sem fabricante pedido, tudo passa.
 function manufacturerMatches(candidateMfr, requestedMfr) {
   if (!requestedMfr || !requestedMfr.trim()) return true; // sem filtro
   if (!candidateMfr) return false;
@@ -142,10 +153,49 @@ function manufacturerMatches(candidateMfr, requestedMfr) {
   return a.includes(b) || b.includes(a);
 }
 
+// Igualdade para AGRUPAR candidatos por fabricante (não para filtrar). Diferente
+// de manufacturerMatches: aqui fabricante vazio só combina com outro vazio —
+// não pode virar curinga que gruta qualquer coisa junto de um fabricante real.
+function manufacturersEqual(a, b) {
+  const x = (a || "").trim().toLowerCase();
+  const y = (b || "").trim().toLowerCase();
+  if (!x && !y) return true;
+  if (!x || !y) return false;
+  return x.includes(y) || y.includes(x);
+}
+
+// Agrupa os itens brutos de UMA fonte por fabricante e escolhe o melhor
+// representante de cada grupo (o que tem status preenchido, quando existe).
+// Sem fabricante pedido, ou quando o pedido não bate com nada, devolve um
+// candidato por fabricante distinto encontrado — é isso que permite comparar
+// TI x onsemi x ST para o mesmo PN em vez de escolher um dos três sem avisar.
+function pickManufacturerCandidates(items, { getMfr, hasStatus, mfr, maxCandidates = MAX_MANUFACTURER_CANDIDATES }) {
+  if (!items.length) return [];
+
+  let pool = items;
+  if (mfr && mfr.trim()) {
+    const filtered = items.filter((it) => manufacturerMatches(getMfr(it), mfr));
+    if (filtered.length) pool = filtered; // não bateu em nada: mantém tudo (filtro soft)
+  }
+
+  const groups = [];
+  pool.forEach((it) => {
+    const m = getMfr(it) || "";
+    let group = groups.find((g) => manufacturersEqual(g.key, m));
+    if (!group) {
+      group = { key: m, items: [] };
+      groups.push(group);
+    }
+    group.items.push(it);
+  });
+
+  return groups.slice(0, maxCandidates).map((g) => g.items.find(hasStatus) || g.items[0]);
+}
+
 // ---- Fonte 1: Mouser ----
 async function queryMouser(pn, mfr) {
   const apiKey = process.env.MOUSER_API_KEY;
-  if (!apiKey) return { result: null, debug: "não configurada" };
+  if (!apiKey) return { results: [], debug: "não configurada" };
 
   try {
     const res = await fetchWithRetry(
@@ -162,52 +212,51 @@ async function queryMouser(pn, mfr) {
     const data = await readJson(res);
     const errors = data.Errors || (data.SearchResults && data.SearchResults.Errors) || [];
     if (Array.isArray(errors) && errors.length) {
-      return { result: null, debug: `erro: ${errors.map((e) => e.Message).join(", ")}` };
+      return { results: [], debug: `erro: ${errors.map((e) => e.Message).join(", ")}` };
     }
 
     const parts = (data.SearchResults && data.SearchResults.Parts) || [];
     let exactMatches = parts.filter(
       (p) => p.ManufacturerPartNumber && p.ManufacturerPartNumber.toLowerCase() === pn.toLowerCase()
     );
-    // Casamento por fabricante, se informado.
-    if (mfr && mfr.trim()) {
-      const filtered = exactMatches.filter((p) => manufacturerMatches(p.Manufacturer, mfr));
-      if (filtered.length) exactMatches = filtered;
-    }
     if (!exactMatches.length) exactMatches = parts.slice(0, 1);
-    if (!exactMatches.length) return { result: null, debug: "componente não encontrado" };
+    if (!exactMatches.length) return { results: [], debug: "componente não encontrado" };
 
-    const withStatus = exactMatches.find((p) => p.LifecycleStatus && p.LifecycleStatus.trim());
-    const match = withStatus || exactMatches[0];
+    const picks = pickManufacturerCandidates(exactMatches, {
+      getMfr: (p) => p.Manufacturer,
+      hasStatus: (p) => !!(p.LifecycleStatus && p.LifecycleStatus.trim()),
+      mfr,
+    });
 
-    const rawStatus = match.LifecycleStatus || "";
-    const status = normalizeStatus(rawStatus);
-    if (status === "unknown" && !rawStatus) {
-      return { result: null, debug: "encontrado, mas sem campo de lifecycle preenchido" };
-    }
+    const results = picks
+      .map((match) => {
+        const rawStatus = match.LifecycleStatus || "";
+        const status = normalizeStatus(rawStatus);
+        if (status === "unknown" && !rawStatus) return null;
+        return {
+          source: "Mouser",
+          status,
+          rawStatus,
+          manufacturer: match.Manufacturer || "",
+          substitute: match.SuggestedReplacement || "",
+          url: match.ProductDetailUrl || "",
+          datasheetUrl: match.DataSheetUrl || "",
+          leadTime: match.LeadTime || "",
+        };
+      })
+      .filter(Boolean);
 
-    return {
-      result: {
-        source: "Mouser",
-        status,
-        rawStatus,
-        manufacturer: match.Manufacturer || "",
-        substitute: match.SuggestedReplacement || "",
-        url: match.ProductDetailUrl || "",
-        datasheetUrl: match.DataSheetUrl || "",
-        leadTime: match.LeadTime || "",
-      },
-      debug: "ok",
-    };
+    if (!results.length) return { results: [], debug: "encontrado, mas sem campo de lifecycle preenchido" };
+    return { results, debug: "ok" };
   } catch (e) {
-    return { result: null, debug: `erro: ${e.message}` };
+    return { results: [], debug: `erro: ${e.message}` };
   }
 }
 
 // ---- Fonte 2: Farnell / element14 / Newark ----
 async function queryFarnell(pn, mfr) {
   const apiKey = process.env.FARNELL_API_KEY;
-  if (!apiKey) return { result: null, debug: "não configurada" };
+  if (!apiKey) return { results: [], debug: "não configurada" };
 
   try {
     const params = new URLSearchParams({
@@ -229,59 +278,58 @@ async function queryFarnell(pn, mfr) {
       data.premierFarnellPartNumberReturn ||
       null;
     if (!root) {
-      return { result: null, debug: `formato inesperado: ${Object.keys(data).join(",") || "vazio"}` };
+      return { results: [], debug: `formato inesperado: ${Object.keys(data).join(",") || "vazio"}` };
     }
     if (!Array.isArray(root.products) || !root.products.length) {
-      return { result: null, debug: "componente não encontrado" };
+      return { results: [], debug: "componente não encontrado" };
     }
 
-    let products = root.products;
-    if (mfr && mfr.trim()) {
-      const filtered = products.filter((p) =>
-        manufacturerMatches(p.vendorName || p.brandName, mfr)
-      );
-      if (filtered.length) products = filtered;
-    }
-
-    const match =
-      products.find(
-        (p) =>
-          (p.translatedManufacturerPartNumber || p.manufacturerPartNumber || "").toLowerCase() === pn.toLowerCase()
-      ) || products[0];
-    if (!match) return { result: null, debug: "componente não encontrado" };
+    // PN exato tem prioridade; sem ele, usa a lista bruta da busca (a API já
+    // busca por manuPartNum, então normalmente é tudo relevante).
+    const pnExact = root.products.filter(
+      (p) =>
+        (p.translatedManufacturerPartNumber || p.manufacturerPartNumber || "").toLowerCase() === pn.toLowerCase()
+    );
+    const pool = pnExact.length ? pnExact : root.products;
 
     const codeMap = { "4": "active", "6": "nrnd", "7": "obsolete" };
-    let status = "unknown";
-    let rawStatus = "";
-    if (match.releaseStatusCode !== undefined && codeMap[String(match.releaseStatusCode)]) {
-      status = codeMap[String(match.releaseStatusCode)];
-      rawStatus = `releaseStatusCode ${match.releaseStatusCode}`;
-    } else if (match.productStatus) {
-      rawStatus = match.productStatus;
-      status = normalizeStatus(match.productStatus);
-    }
-    if (status === "unknown") {
-      return { result: null, debug: "encontrado, mas sem status reconhecível" };
-    }
-
-    const datasheetUrl =
-      (Array.isArray(match.datasheets) && match.datasheets[0] && match.datasheets[0].url) || "";
-
-    return {
-      result: {
-        source: "Farnell/element14",
-        status,
-        rawStatus,
-        manufacturer: match.vendorName || match.brandName || "",
-        substitute: "",
-        url: match.productURL || match.translatedURL || "",
-        datasheetUrl,
-        leadTime: match.leadTime || "",
-      },
-      debug: "ok",
+    const deriveStatus = (p) => {
+      if (p.releaseStatusCode !== undefined && codeMap[String(p.releaseStatusCode)]) {
+        return { status: codeMap[String(p.releaseStatusCode)], rawStatus: `releaseStatusCode ${p.releaseStatusCode}` };
+      }
+      if (p.productStatus) return { status: normalizeStatus(p.productStatus), rawStatus: p.productStatus };
+      return { status: "unknown", rawStatus: "" };
     };
+
+    const picks = pickManufacturerCandidates(pool, {
+      getMfr: (p) => p.vendorName || p.brandName,
+      hasStatus: (p) => deriveStatus(p).status !== "unknown",
+      mfr,
+    });
+
+    const results = picks
+      .map((match) => {
+        const { status, rawStatus } = deriveStatus(match);
+        if (status === "unknown") return null;
+        const datasheetUrl =
+          (Array.isArray(match.datasheets) && match.datasheets[0] && match.datasheets[0].url) || "";
+        return {
+          source: "Farnell/element14",
+          status,
+          rawStatus,
+          manufacturer: match.vendorName || match.brandName || "",
+          substitute: "",
+          url: match.productURL || match.translatedURL || "",
+          datasheetUrl,
+          leadTime: match.leadTime || "",
+        };
+      })
+      .filter(Boolean);
+
+    if (!results.length) return { results: [], debug: "encontrado, mas sem status reconhecível" };
+    return { results, debug: "ok" };
   } catch (e) {
-    return { result: null, debug: `erro: ${e.message}` };
+    return { results: [], debug: `erro: ${e.message}` };
   }
 }
 
@@ -289,10 +337,10 @@ async function queryFarnell(pn, mfr) {
 async function queryTrustedParts(pn, mfr) {
   const apiKey = process.env.TRUSTEDPARTS_API_KEY;
   const companyId = process.env.TRUSTEDPARTS_COMPANY_ID;
-  if (!apiKey) return { result: null, debug: "não configurada" };
+  if (!apiKey) return { results: [], debug: "não configurada" };
   if (!companyId) {
     return {
-      result: null,
+      results: [],
       debug: "falta TRUSTEDPARTS_COMPANY_ID (a API exige Company ID + API Key em toda requisição)",
     };
   }
@@ -326,7 +374,7 @@ async function queryTrustedParts(pn, mfr) {
     const data = await readJson(res);
     if (res.status >= 400) {
       return {
-        result: null,
+        results: [],
         debug: `HTTP ${res.status}: ${JSON.stringify(data).slice(0, 160)}`,
       };
     }
@@ -334,47 +382,55 @@ async function queryTrustedParts(pn, mfr) {
     // A estrutura pode variar; tenta os caminhos conhecidos da v2.
     const products = data.Products || data.products || (data.Results && data.Results.Products) || [];
     if (!Array.isArray(products) || !products.length) {
-      return { result: null, debug: "componente não encontrado no canal autorizado" };
+      return { results: [], debug: "componente não encontrado no canal autorizado" };
     }
 
-    let candidates = products;
-    if (mfr && mfr.trim()) {
-      const filtered = products.filter((p) => manufacturerMatches(p.Manufacturer || p.manufacturer, mfr));
-      if (filtered.length) candidates = filtered;
-    }
+    const picks = pickManufacturerCandidates(products, {
+      getMfr: (p) => p.Manufacturer || p.manufacturer,
+      hasStatus: (p) =>
+        !!(
+          p.LifecycleStatus ||
+          p.lifecycleStatus ||
+          (p.LifecycleRisk && (p.LifecycleRisk.Status || p.LifecycleRisk.status))
+        ),
+      mfr,
+    });
 
-    const match = candidates[0];
-    const rawLifecycle =
-      match.LifecycleStatus || match.lifecycleStatus ||
-      (match.LifecycleRisk && (match.LifecycleRisk.Status || match.LifecycleRisk.status)) || "";
-    const status = normalizeStatus(rawLifecycle);
+    const results = picks
+      .map((match) => {
+        const rawLifecycle =
+          match.LifecycleStatus ||
+          match.lifecycleStatus ||
+          (match.LifecycleRisk && (match.LifecycleRisk.Status || match.LifecycleRisk.status)) ||
+          "";
+        const status = normalizeStatus(rawLifecycle);
 
-    // TrustedParts é valioso mesmo sem status explícito: confirma que o PN
-    // ainda tem distribuidor AUTORIZADO com estoque (sinal indireto de "vivo").
-    const hasAuthorizedStock =
-      (Array.isArray(match.Distributors) && match.Distributors.length > 0) ||
-      (match.TotalAvailability && Number(match.TotalAvailability) > 0);
+        // TrustedParts é valioso mesmo sem status explícito: confirma que o PN
+        // ainda tem distribuidor AUTORIZADO com estoque (sinal indireto de "vivo").
+        const hasAuthorizedStock =
+          (Array.isArray(match.Distributors) && match.Distributors.length > 0) ||
+          (match.TotalAvailability && Number(match.TotalAvailability) > 0);
 
-    if (status === "unknown" && !hasAuthorizedStock) {
-      return { result: null, debug: "encontrado, mas sem status nem estoque autorizado" };
-    }
+        if (status === "unknown" && !hasAuthorizedStock) return null;
 
-    return {
-      result: {
-        source: "TrustedParts",
-        status,
-        rawStatus: rawLifecycle || (hasAuthorizedStock ? "com estoque em canal autorizado" : ""),
-        manufacturer: match.Manufacturer || match.manufacturer || "",
-        substitute: "",
-        url: match.ProductUrl || match.productUrl || "",
-        datasheetUrl: match.DatasheetUrl || match.datasheetUrl || "",
-        leadTime: "",
-        authorizedStock: !!hasAuthorizedStock,
-      },
-      debug: "ok",
-    };
+        return {
+          source: "TrustedParts",
+          status,
+          rawStatus: rawLifecycle || (hasAuthorizedStock ? "com estoque em canal autorizado" : ""),
+          manufacturer: match.Manufacturer || match.manufacturer || "",
+          substitute: "",
+          url: match.ProductUrl || match.productUrl || "",
+          datasheetUrl: match.DatasheetUrl || match.datasheetUrl || "",
+          leadTime: "",
+          authorizedStock: !!hasAuthorizedStock,
+        };
+      })
+      .filter(Boolean);
+
+    if (!results.length) return { results: [], debug: "encontrado, mas sem status nem estoque autorizado" };
+    return { results, debug: "ok" };
   } catch (e) {
-    return { result: null, debug: `erro: ${e.message}` };
+    return { results: [], debug: `erro: ${e.message}` };
   }
 }
 
@@ -451,11 +507,11 @@ async function getDigiKeyToken() {
 
 async function queryDigiKey(pn, mfr) {
   const clientId = process.env.DIGIKEY_CLIENT_ID;
-  if (!clientId) return { result: null, debug: "não configurada" };
+  if (!clientId) return { results: [], debug: "não configurada" };
 
   try {
     const { token, error: tokenError } = await getDigiKeyToken();
-    if (!token) return { result: null, debug: tokenError || "falha ao obter token OAuth2" };
+    if (!token) return { results: [], debug: tokenError || "falha ao obter token OAuth2" };
 
     const res = await fetchWithRetry(
       DIGIKEY_SEARCH_URL,
@@ -480,60 +536,57 @@ async function queryDigiKey(pn, mfr) {
     const data = await readJson(res);
     if (res.status >= 400) {
       return {
-        result: null,
+        results: [],
         debug: `HTTP ${res.status}: ${JSON.stringify(data).slice(0, 160)}`,
       };
     }
 
     const products = data.Products || data.ExactMatches || [];
     if (!Array.isArray(products) || !products.length) {
-      return { result: null, debug: "componente não encontrado" };
+      return { results: [], debug: "componente não encontrado" };
     }
 
-    let candidates = products.filter(
+    let pnExact = products.filter(
       (p) =>
         p.ManufacturerProductNumber &&
         p.ManufacturerProductNumber.toLowerCase() === pn.toLowerCase()
     );
-    if (!candidates.length) candidates = products;
+    const pool = pnExact.length ? pnExact : products;
 
-    if (mfr && mfr.trim()) {
-      const filtered = candidates.filter((p) =>
-        manufacturerMatches(p.Manufacturer && p.Manufacturer.Name, mfr)
-      );
-      if (filtered.length) candidates = filtered;
-    }
+    const picks = pickManufacturerCandidates(pool, {
+      getMfr: (p) => p.Manufacturer && p.Manufacturer.Name,
+      hasStatus: (p) => !!(p.ProductStatus && p.ProductStatus.Status),
+      mfr,
+    });
 
-    const match = candidates[0];
-    if (!match) return { result: null, debug: "componente não encontrado" };
+    const results = picks
+      .map((match) => {
+        const rawStatus = (match.ProductStatus && match.ProductStatus.Status) || "";
+        const status = normalizeStatus(rawStatus);
+        if (status === "unknown" && !rawStatus) return null;
+        return {
+          source: "DigiKey",
+          status,
+          rawStatus,
+          manufacturer: (match.Manufacturer && match.Manufacturer.Name) || "",
+          substitute: "",
+          url: match.ProductUrl || "",
+          datasheetUrl: match.DatasheetUrl || "",
+          leadTime: "",
+        };
+      })
+      .filter(Boolean);
 
-    const rawStatus = (match.ProductStatus && match.ProductStatus.Status) || "";
-    const status = normalizeStatus(rawStatus);
-    if (status === "unknown" && !rawStatus) {
-      return { result: null, debug: "encontrado, mas sem campo de status preenchido" };
-    }
-
-    const datasheetUrl = match.DatasheetUrl || "";
-
-    return {
-      result: {
-        source: "DigiKey",
-        status,
-        rawStatus,
-        manufacturer: (match.Manufacturer && match.Manufacturer.Name) || "",
-        substitute: "",
-        url: match.ProductUrl || "",
-        datasheetUrl,
-        leadTime: "",
-      },
-      debug: "ok",
-    };
+    if (!results.length) return { results: [], debug: "encontrado, mas sem campo de status preenchido" };
+    return { results, debug: "ok" };
   } catch (e) {
-    return { result: null, debug: `erro: ${e.message}` };
+    return { results: [], debug: `erro: ${e.message}` };
   }
 }
 
-// Calcula status final + confiança ponderada a partir das fontes que responderam.
+// Calcula status final + confiança ponderada a partir das fontes que responderam
+// para o MESMO fabricante (o agrupamento por fabricante acontece antes, no
+// handler — aqui as fontes já falam da mesma peça).
 function combine(results) {
   // Considera só as que têm status conclusivo para votar.
   const conclusive = results.filter((r) => r.status !== "unknown");
@@ -558,43 +611,122 @@ function combine(results) {
     votes[r.status] = (votes[r.status] || 0) + w;
   });
   const ranked = Object.entries(votes).sort((a, b) => b[1] - a[1]);
-  const [topStatus, topWeight] = ranked[0];
+  const [topStatus] = ranked[0];
   const distinct = ranked.length;
 
   // Divergência real entre fontes conclusivas => não conclusivo (força manual).
+  // Como o agrupamento por fabricante já separou os candidatos antes de chegar
+  // aqui, isso agora significa que fontes DISCORDAM sobre a MESMA peça — não
+  // que são fabricantes diferentes (isso vira grupos/candidatos separados).
   if (distinct > 1) {
     return {
       status: "unknown",
       confidence: "low",
-      note: "Fontes conclusivas divergem entre si — verificação manual necessária.",
+      note: "Fontes conclusivas divergem entre si para o mesmo fabricante — verificação manual necessária.",
       diverge: true,
     };
   }
 
-  // Todas concordam. Confiança pelo nº de fontes independentes concordando.
-  const agreeingSources = conclusive.filter((r) => r.status === topStatus);
-  const agreeing = agreeingSources.length;
+  const agreeing = conclusive.filter((r) => r.status === topStatus).length;
+  const confidence = agreeing >= 2 ? "high" : "medium"; // fonte única
+  return { status: topStatus, confidence, agreeing };
+}
 
-  // Duas fontes concordarem só vale como confirmação se estiverem falando da
-  // MESMA peça. O mesmo PN existe em fabricantes diferentes (LM317T da TI, da
-  // onsemi, da ST) com lifecycles diferentes — nesse caso a concordância é
-  // coincidência, não corroboração, e não pode virar confiança alta.
-  const mfrs = agreeingSources.map((r) => r.manufacturer).filter(Boolean);
-  let mfrConflict = false;
-  for (let i = 0; i < mfrs.length && !mfrConflict; i++) {
-    for (let j = i + 1; j < mfrs.length; j++) {
-      if (!manufacturerMatches(mfrs[i], mfrs[j])) {
-        mfrConflict = true;
-        break;
-      }
+// Fontes (links) e datasheets do grupo, deduplicados. Escopado por grupo: um
+// candidato de fabricante só mostra as fontes que falaram DELE, não das outras.
+function dedupeSources(items) {
+  const sources = [];
+  const seen = new Set();
+  items.forEach((r) => {
+    if (r.url && !seen.has(r.url)) {
+      seen.add(r.url);
+      sources.push({ name: r.source, url: r.url });
     }
+  });
+  items.forEach((r) => {
+    if (r.datasheetUrl && !seen.has(r.datasheetUrl)) {
+      seen.add(r.datasheetUrl);
+      sources.push({ name: `Datasheet (${r.source})`, url: r.datasheetUrl });
+    }
+  });
+  return sources;
+}
+
+// Monta um candidato (um fabricante) a partir dos resultados das fontes que
+// concordam se tratar dele.
+function buildCandidate(items) {
+  const combined = combine(items);
+  const subResult = items.find((r) => r.substitute);
+  const substitute = subResult ? subResult.substitute : "";
+  const substituteSource = subResult ? subResult.source : "";
+  const manufacturer = items.find((r) => r.manufacturer)?.manufacturer || "";
+  // Lead time zerado é o valor default do catálogo quando não há prazo, não um
+  // prazo de zero dia — anunciá-lo numa peça obsoleta induz ao erro.
+  const leadTime = items.find((r) => r.leadTime && !/^0\s*\D*$/.test(String(r.leadTime).trim()))?.leadTime || "";
+  const perSource = items.map((r) => `${r.source}: ${r.rawStatus || r.status}`).join("; ");
+
+  let notes;
+  if (combined.status === "unknown") {
+    notes = `${combined.note || "Não conclusivo."} Fontes: ${perSource}.${leadTime ? " Lead time: " + leadTime + "." : ""}`;
+  } else {
+    const agree =
+      combined.agreeing > 1 ? ` — ${combined.agreeing} fontes independentes concordam` : ` — fonte única`;
+    notes = `Lifecycle: "${combined.status}"${manufacturer ? " — " + manufacturer : ""}${agree} (${perSource}).${leadTime ? " Lead time: " + leadTime + "." : ""}`;
   }
 
-  let confidence;
-  if (mfrConflict) confidence = "medium";
-  else if (agreeing >= 2) confidence = "high";
-  else confidence = "medium"; // fonte única
-  return { status: topStatus, confidence, agreeing, mfrConflict };
+  return {
+    manufacturer,
+    status: combined.status,
+    confidence: combined.confidence,
+    substitute,
+    substituteSource,
+    notes,
+    sources: dedupeSources(items).slice(0, 5),
+    agreeing: combined.agreeing || 0,
+    sourceCount: items.length,
+    ambiguous: !!combined.diverge,
+  };
+}
+
+// Agrupa resultados de TODAS as fontes por fabricante (fuzzy). É aqui que
+// "LM317T sem fabricante informado" vira grupos separados por TI/onsemi/ST em
+// vez de um resultado só escolhido sem critério de negócio.
+function groupByManufacturer(results) {
+  const groups = [];
+  results.forEach((r) => {
+    const m = r.manufacturer || "";
+    let group = groups.find((g) => manufacturersEqual(g.key, m));
+    if (!group) {
+      group = { key: m, items: [] };
+      groups.push(group);
+    }
+    group.items.push(r);
+  });
+  return groups;
+}
+
+const CONFIDENCE_RANK = { high: 3, medium: 2, low: 1 };
+
+// Ordena candidatos: confiança primeiro, depois nº de fontes concordando,
+// depois nº total de fontes que falaram dele, depois se tem fabricante nomeado
+// (grupo "fabricante não identificado" fica por último em empate).
+function compareCandidates(a, b) {
+  const ra = [
+    CONFIDENCE_RANK[a.confidence] || 0,
+    a.agreeing,
+    a.sourceCount,
+    a.manufacturer ? 1 : 0,
+  ];
+  const rb = [
+    CONFIDENCE_RANK[b.confidence] || 0,
+    b.agreeing,
+    b.sourceCount,
+    b.manufacturer ? 1 : 0,
+  ];
+  for (let i = 0; i < ra.length; i++) {
+    if (rb[i] !== ra[i]) return rb[i] - ra[i];
+  }
+  return 0;
 }
 
 exports.handler = async (event) => {
@@ -641,33 +773,20 @@ exports.handler = async (event) => {
       queryDigiKey(trimmedPn, mfr),
     ]);
 
-    const outs = [mouserOut, farnellOut, tpOut, dkOut];
-    const results = outs.map((o) => o.result).filter(Boolean);
+    const outs = [
+      { name: "Mouser", out: mouserOut },
+      { name: "Farnell", out: farnellOut },
+      { name: "TrustedParts", out: tpOut },
+      { name: "DigiKey", out: dkOut },
+    ];
+    const allResults = outs.flatMap(({ out }) => out.results || []);
 
-    const diagnostics = [];
-    if (!mouserOut.result) diagnostics.push(`Mouser: ${mouserOut.debug}`);
-    if (!farnellOut.result) diagnostics.push(`Farnell: ${farnellOut.debug}`);
-    if (!tpOut.result) diagnostics.push(`TrustedParts: ${tpOut.debug}`);
-    if (!dkOut.result) diagnostics.push(`DigiKey: ${dkOut.debug}`);
+    const diagnostics = outs
+      .filter(({ out }) => !out.results || !out.results.length)
+      .map(({ name, out }) => `${name}: ${out.debug}`);
     const diagSuffix = diagnostics.length ? ` [${diagnostics.join(" | ")}]` : "";
 
-    // Fontes (links) e datasheets, deduplicados.
-    const sources = [];
-    const seen = new Set();
-    results.forEach((r) => {
-      if (r.url && !seen.has(r.url)) {
-        seen.add(r.url);
-        sources.push({ name: r.source, url: r.url });
-      }
-    });
-    results.forEach((r) => {
-      if (r.datasheetUrl && !seen.has(r.datasheetUrl)) {
-        seen.add(r.datasheetUrl);
-        sources.push({ name: `Datasheet (${r.source})`, url: r.datasheetUrl });
-      }
-    });
-
-    if (!results.length) {
+    if (!allResults.length) {
       return {
         statusCode: 200,
         headers: cors,
@@ -682,54 +801,34 @@ exports.handler = async (event) => {
       };
     }
 
-    const combined = combine(results);
-    // Guarda de qual fonte veio o substituto. O SuggestedReplacement da Mouser é
-    // o código de estoque DELA (ex.: 863-LM317TG), não um MPN de fabricante —
-    // sem rótulo, alguém colaria isso numa BOM achando que é part number.
-    const subResult = results.find((r) => r.substitute);
-    const substitute = subResult ? subResult.substitute : "";
-    const substituteSource = subResult ? subResult.source : "";
-    const manufacturer = results.find((r) => r.manufacturer)?.manufacturer || "";
-    // Lead time zerado é o valor default do catálogo quando não há prazo, não um
-    // prazo de zero dia — anunciá-lo numa peça obsoleta induz ao erro.
-    const leadTime = results.find((r) => r.leadTime && !/^0\s*\D*$/.test(String(r.leadTime).trim()))?.leadTime || "";
+    const candidates = groupByManufacturer(allResults)
+      .map((g) => buildCandidate(g.items))
+      .sort(compareCandidates)
+      .slice(0, MAX_MANUFACTURER_CANDIDATES);
 
-    // Monta a nota final detalhada. Quando os fabricantes divergem, cada fonte
-    // aparece com o seu — é a informação que explica por que a confiança caiu.
-    const perSource = results
-      .map((r) =>
-        combined.mfrConflict && r.manufacturer
-          ? `${r.source} (${r.manufacturer}): ${r.rawStatus || r.status}`
-          : `${r.source}: ${r.rawStatus || r.status}`
-      )
-      .join("; ");
-
-    let notes;
-    if (combined.status === "unknown") {
-      notes = `${combined.note || "Não conclusivo."} Fontes: ${perSource}.${leadTime ? " Lead time: " + leadTime + "." : ""}${diagSuffix}`;
-    } else if (combined.mfrConflict) {
-      notes = `Lifecycle: "${combined.status}" — ATENÇÃO: as fontes respondem por fabricantes diferentes para este PN, então a concordância não confirma a mesma peça. Informe o fabricante para desambiguar (${perSource}).${leadTime ? " Lead time: " + leadTime + "." : ""}${diagSuffix}`;
-    } else {
-      const agree =
-        combined.agreeing > 1
-          ? ` — ${combined.agreeing} fontes independentes concordam`
-          : ` — fonte única`;
-      notes = `Lifecycle: "${combined.status}"${manufacturer ? " — " + manufacturer : ""}${agree} (${perSource}).${leadTime ? " Lead time: " + leadTime + "." : ""}${diagSuffix}`;
+    const primary = candidates[0];
+    let notes = primary.notes + diagSuffix;
+    if (candidates.length > 1) {
+      const others = candidates
+        .slice(1)
+        .map((c) => `${c.manufacturer || "fabricante não identificado"} (${c.status})`)
+        .join(", ");
+      notes += ` Este PN também é feito por: ${others} — informe o fabricante para focar em um só.`;
     }
 
     return {
       statusCode: 200,
       headers: cors,
       body: JSON.stringify({
-        status: combined.status,
-        confidence: combined.confidence,
-        substitute,
-        substituteSource,
-        manufacturer,
+        status: primary.status,
+        confidence: primary.confidence,
+        substitute: primary.substitute,
+        substituteSource: primary.substituteSource,
+        manufacturer: primary.manufacturer,
         notes,
-        sources: sources.slice(0, 5),
-        ambiguous: !!combined.diverge,
-        mfrConflict: !!combined.mfrConflict,
+        sources: primary.sources,
+        ambiguous: primary.ambiguous,
+        candidates: candidates.length > 1 ? candidates : undefined,
       }),
     };
   } catch (err) {

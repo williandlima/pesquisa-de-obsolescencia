@@ -17,6 +17,24 @@ const FIXTURES = {
     notes: 'Lifecycle: "nrnd" — fonte única.', sources: [] },
   DESCONHECIDO: { status: "unknown", confidence: "low", substitute: "", manufacturer: "",
     notes: "Componente não encontrado nas bases consultadas.", sources: [] },
+  // PN feito por 3 fabricantes diferentes — exercita a UI de candidatos.
+  MULTIMFR001: {
+    status: "active", confidence: "high", substitute: "", substituteSource: "",
+    manufacturer: "Texas Instruments",
+    notes: 'Lifecycle: "active" — Texas Instruments — 2 fontes independentes concordam (Mouser: Active; DigiKey: Active). Este PN também é feito por: onsemi (obsolete), STMicroelectronics (active) — informe o fabricante para focar em um só.',
+    sources: [{ name: "Mouser", url: "http://127.0.0.1:{PORT}/fake/mouser-ti" }],
+    candidates: [
+      { manufacturer: "Texas Instruments", status: "active", confidence: "high", substitute: "", substituteSource: "",
+        notes: 'Lifecycle: "active" — Texas Instruments — 2 fontes independentes concordam (Mouser: Active; DigiKey: Active).',
+        sources: [{ name: "Mouser", url: "http://127.0.0.1:{PORT}/fake/mouser-ti" }], agreeing: 2, sourceCount: 2 },
+      { manufacturer: "onsemi", status: "obsolete", confidence: "medium", substitute: "863-LM317TG", substituteSource: "Mouser",
+        notes: 'Lifecycle: "obsolete" — onsemi — fonte única (Mouser: Obsolete).',
+        sources: [{ name: "Mouser", url: "http://127.0.0.1:{PORT}/fake/mouser-onsemi" }], agreeing: 1, sourceCount: 1 },
+      { manufacturer: "STMicroelectronics", status: "active", confidence: "medium", substitute: "", substituteSource: "",
+        notes: 'Lifecycle: "active" — STMicroelectronics — fonte única (Farnell/element14: Active).',
+        sources: [{ name: "Farnell/element14", url: "http://127.0.0.1:{PORT}/fake/farnell-st" }], agreeing: 1, sourceCount: 1 },
+    ],
+  },
 };
 
 function start(port) {

@@ -110,7 +110,7 @@ async function invoke({ env, routes, body }) {
     check("mfr='onsemi' seleciona o onsemi (obsolete)", parsed.status, "obsolete");
   }
 
-  console.log("\n== handler: fabricantes cruzados sem filtro (risco) ==");
+  console.log("\n== handler: fabricantes diferentes sem filtro viram candidatos separados ==");
   {
     const { parsed } = await invoke({
       env: { MOUSER_API_KEY: "k", DIGIKEY_CLIENT_ID: "id", DIGIKEY_CLIENT_SECRET: "sec" },
@@ -124,8 +124,17 @@ async function invoke({ env, routes, body }) {
       body: { pn: "LM317T" },
     });
     info(`Mouser=TI/active + DigiKey=onsemi/active => status=${parsed.status} conf=${parsed.confidence}`);
-    info(`  manufacturer reportado: "${parsed.manufacturer}" (mas 2 fabricantes distintos responderam)`);
-    check("confiança NÃO deveria ser 'high' com fabricantes distintos", parsed.confidence, "medium");
+    info(`candidates: ${JSON.stringify((parsed.candidates || []).map((c) => [c.manufacturer, c.status, c.confidence]))}`);
+    // Cada fabricante só tem 1 fonte falando dele — nenhum vira confiança alta
+    // por coincidência de status entre fabricantes diferentes.
+    check("confiança do primário é 'medium' (fonte única dentro do grupo)", parsed.confidence, "medium");
+    check("aparecem 2 candidatos (TI e onsemi), não 1 escolhido arbitrariamente",
+      (parsed.candidates || []).length, 2);
+    check("TI vem primeiro (Mouser é consultado antes da DigiKey)", parsed.manufacturer, "Texas Instruments");
+    check("onsemi não é descartado — aparece como 2º candidato",
+      parsed.candidates.some((c) => c.manufacturer === "onsemi"), true);
+    check("nota principal avisa sobre o outro fabricante",
+      /também é feito por: onsemi/.test(parsed.notes), true);
   }
 
   console.log("\n== handler: degradação graciosa ==");

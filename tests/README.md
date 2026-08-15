@@ -14,10 +14,11 @@ linha de total que o `run.js` agrega.
 
 | Arquivo | Cobre |
 |---|---|
-| `backend.test.js` | `normalizeStatus` contra os rótulos reais de Mouser, Digi-Key, TI, ST e Microchip; `manufacturerMatches`; votação e confiança do `combine`. |
-| `handler.test.js` | O handler inteiro com `fetch` mockado: concordância, divergência, filtro por fabricante, degradação graciosa, respostas HTML de erro, orçamento de tempo e fonte pendurada. |
+| `backend.test.js` | `normalizeStatus` contra os rótulos reais de Mouser, Digi-Key, TI, ST e Microchip; `manufacturerMatches` (filtro) vs. `manufacturersEqual` (agrupamento); `pickManufacturerCandidates`, `compareCandidates` e votação/confiança do `combine`. |
+| `handler.test.js` | O handler inteiro com `fetch` mockado: concordância, divergência, filtro por fabricante, fabricantes diferentes viram candidatos separados, degradação graciosa, respostas HTML de erro, orçamento de tempo e fonte pendurada. |
 | `frontend.test.js` | A página real num Chromium contra um backend falso: verificação individual, envio do fabricante, log, persistência, batch, deduplicação, importação de CSV, exportação e sanitização de XSS. |
 | `frontend2.test.js` | Casos de borda: CSV com aspas, CSV com `;` (Excel pt-BR), coluna de fabricante, fallback do export sem CDN, cancelamento do batch e alerta de dado velho. |
+| `frontend3.test.js` | PN com vários fabricantes: chips de candidato, troca sem nova chamada à API, "Usar no log" gravando o candidato selecionado (não sempre o primário), e ausência de chips quando só há 1 fabricante. |
 
 ## Como o backend é carregado
 
