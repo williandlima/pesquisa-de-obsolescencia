@@ -1,4 +1,4 @@
-// Netlify Function: check-part  (v6)
+// Cloudflare Pages Function: /api/check-part  (v6 — portado da Netlify)
 // Consulta QUATRO fontes independentes e cruza os resultados:
 //   1. Mouser (distribuidor autorizado)
 //   2. Farnell/element14/Newark (distribuidor autorizado)
@@ -16,13 +16,20 @@
 //   - Casamento por PN + fabricante quando o usuário informa o fabricante (filtro
 //     é "soft": se nada bater, mostra os candidatos encontrados em vez de falhar).
 //   - Degradação graciosa: qualquer fonte pode falhar sem derrubar as outras, e
-//     cada uma tem orçamento de tempo próprio (a função morre em ~10s).
+//     cada uma tem orçamento de tempo próprio.
 //
-// Env vars no Netlify (todas opcionais, mas pelo menos uma precisa existir):
+// Roteamento: este arquivo em functions/api/check-part.js fica disponível
+// automaticamente em /api/check-part — Cloudflare Pages usa roteamento por
+// diretório, não precisa de redirect explícito (diferente da Netlify).
+//
+// Variáveis de ambiente (Settings → Variables and Secrets no dashboard, ou
+// `wrangler pages secret put` — todas opcionais, mas pelo menos uma precisa
+// existir; use "Secret", não "Variável de texto", para as chaves de API):
 //   MOUSER_API_KEY
 //   FARNELL_API_KEY
 //   TRUSTEDPARTS_API_KEY + TRUSTEDPARTS_COMPANY_ID  (a ECIA exige os dois)
 //   DIGIKEY_CLIENT_ID + DIGIKEY_CLIENT_SECRET
+//   ALLOWED_ORIGIN (opcional — domínio liberado no CORS; ver DEFAULT_ALLOWED_ORIGIN)
 
 const MOUSER_URL = "https://api.mouser.com/api/v1/search/partnumber";
 const FARNELL_URL = "https://api.element14.com/catalog/products";
@@ -78,15 +85,19 @@ function normalizeStatus(raw) {
   return "unknown";
 }
 
-// A função da Netlify é morta em ~10s. Sem teto de tempo por fonte, uma única
-// API pendurada trava as outras três e o usuário recebe um erro genérico de
-// timeout em vez dos resultados que já estavam prontos. Por isso cada fonte tem
-// orçamento próprio e cada tentativa é abortada individualmente.
+// Uma requisição pendurada não pode travar as outras três, que rodam em
+// paralelo. Por isso cada fonte tem orçamento próprio e cada tentativa é
+// abortada individualmente.
 //
-// O teto precisa ser generoso: as fontes rodam EM PARALELO, então o tempo total
-// da função é o da fonte mais lenta, não a soma. Um teto curto não acelera nada
-// — só descarta fonte lenta que teria respondido. A element14/Farnell passa dos
-// 3s com frequência, e perder uma fonte boa é pior que esperar mais um pouco.
+// Nos Workers/Pages Functions não há teto de wall-clock para requisições
+// HTTP (só CPU time — 10ms no plano free, e isso aqui é I/O-bound esperando
+// fetch, então CPU time não é o gargalo). O teto abaixo não existe pra
+// sobreviver a um limite de plataforma; é escolha de UX — ninguém quer
+// esperar mais que isso por uma consulta. Ainda precisa ser generoso: as
+// fontes rodam EM PARALELO, então o tempo total da função é o da fonte mais
+// lenta, não a soma, e um teto curto não acelera nada — só descarta fonte
+// lenta que teria respondido. A element14/Farnell passa dos 3s com
+// frequência, e perder uma fonte boa é pior que esperar mais um pouco.
 const SOURCE_DEADLINE_MS = 7500; // orçamento total de uma fonte (todas as tentativas)
 const ATTEMPT_TIMEOUT_MS = 7000; // teto de uma tentativa isolada
 
@@ -116,8 +127,7 @@ async function fetchWithRetry(url, options, maxRetries = 2, deadlineMs = SOURCE_
     } catch (err) {
       clearTimeout(timer);
       if (err && err.name === "AbortError") {
-        // Fonte pendurada: repetir só queimaria o orçamento das outras três,
-        // que rodam em paralelo dentro do mesmo limite de 10s da função.
+        // Fonte pendurada: repetir só queimaria o orçamento das outras três.
         throw new Error(`tempo esgotado (${budget}ms sem resposta)`);
       }
       lastErr = err;
@@ -193,8 +203,8 @@ function pickManufacturerCandidates(items, { getMfr, hasStatus, mfr, maxCandidat
 }
 
 // ---- Fonte 1: Mouser ----
-async function queryMouser(pn, mfr) {
-  const apiKey = process.env.MOUSER_API_KEY;
+async function queryMouser(pn, mfr, env) {
+  const apiKey = env.MOUSER_API_KEY;
   if (!apiKey) return { results: [], debug: "não configurada" };
 
   try {
@@ -249,13 +259,14 @@ async function queryMouser(pn, mfr) {
     if (!results.length) return { results: [], debug: "encontrado, mas sem campo de lifecycle preenchido" };
     return { results, debug: "ok" };
   } catch (e) {
+    console.error(`[check-part] Mouser falhou para "${pn}":`, e.message);
     return { results: [], debug: `erro: ${e.message}` };
   }
 }
 
 // ---- Fonte 2: Farnell / element14 / Newark ----
-async function queryFarnell(pn, mfr) {
-  const apiKey = process.env.FARNELL_API_KEY;
+async function queryFarnell(pn, mfr, env) {
+  const apiKey = env.FARNELL_API_KEY;
   if (!apiKey) return { results: [], debug: "não configurada" };
 
   try {
@@ -329,14 +340,15 @@ async function queryFarnell(pn, mfr) {
     if (!results.length) return { results: [], debug: "encontrado, mas sem status reconhecível" };
     return { results, debug: "ok" };
   } catch (e) {
+    console.error(`[check-part] Farnell falhou para "${pn}":`, e.message);
     return { results: [], debug: `erro: ${e.message}` };
   }
 }
 
 // ---- Fonte 3: TrustedParts.com (ECIA — só canal autorizado) ----
-async function queryTrustedParts(pn, mfr) {
-  const apiKey = process.env.TRUSTEDPARTS_API_KEY;
-  const companyId = process.env.TRUSTEDPARTS_COMPANY_ID;
+async function queryTrustedParts(pn, mfr, env) {
+  const apiKey = env.TRUSTEDPARTS_API_KEY;
+  const companyId = env.TRUSTEDPARTS_COMPANY_ID;
   if (!apiKey) return { results: [], debug: "não configurada" };
   if (!companyId) {
     return {
@@ -430,23 +442,27 @@ async function queryTrustedParts(pn, mfr) {
     if (!results.length) return { results: [], debug: "encontrado, mas sem status nem estoque autorizado" };
     return { results, debug: "ok" };
   } catch (e) {
+    console.error(`[check-part] TrustedParts falhou para "${pn}":`, e.message);
     return { results: [], debug: `erro: ${e.message}` };
   }
 }
 
 // ---- Fonte 4: Digi-Key (maior catálogo, milhares de fabricantes) ----
+// Em Workers, o módulo pode ficar "quente" entre requisições (mesmo isolate),
+// então este cache best-effort ainda ajuda — mas não é garantido persistir,
+// já que o runtime pode reciclar o isolate a qualquer momento.
 let dkTokenCache = null;
 let dkTokenExpiry = 0;
 
 // Devolve { token } ou { error }. O motivo precisa chegar até as notas do
 // resultado: "falha ao obter token" sozinho não diz se a credencial está errada,
 // se é de sandbox, ou se a aplicação não tem a Product Information habilitada.
-async function getDigiKeyToken() {
+async function getDigiKeyToken(env) {
   const now = Date.now();
   if (dkTokenCache && now < dkTokenExpiry - 60000) return { token: dkTokenCache };
 
-  const clientId = process.env.DIGIKEY_CLIENT_ID;
-  const clientSecret = process.env.DIGIKEY_CLIENT_SECRET;
+  const clientId = env.DIGIKEY_CLIENT_ID;
+  const clientSecret = env.DIGIKEY_CLIENT_SECRET;
   // Nomear exatamente a variável que falta: dizer "faltam A/B" quando só B
   // falta manda o usuário procurar no lugar errado.
   const missing = [
@@ -455,7 +471,7 @@ async function getDigiKeyToken() {
   ].filter(Boolean);
   if (missing.length) {
     return {
-      error: `falta a variável de ambiente ${missing.join(" e ")} no Netlify (defina e refaça o deploy)`,
+      error: `falta a variável de ambiente ${missing.join(" e ")} no Cloudflare Pages (defina e refaça o deploy)`,
     };
   }
 
@@ -505,12 +521,12 @@ async function getDigiKeyToken() {
   return { token: dkTokenCache };
 }
 
-async function queryDigiKey(pn, mfr) {
-  const clientId = process.env.DIGIKEY_CLIENT_ID;
+async function queryDigiKey(pn, mfr, env) {
+  const clientId = env.DIGIKEY_CLIENT_ID;
   if (!clientId) return { results: [], debug: "não configurada" };
 
   try {
-    const { token, error: tokenError } = await getDigiKeyToken();
+    const { token, error: tokenError } = await getDigiKeyToken(env);
     if (!token) return { results: [], debug: tokenError || "falha ao obter token OAuth2" };
 
     const res = await fetchWithRetry(
@@ -580,6 +596,7 @@ async function queryDigiKey(pn, mfr) {
     if (!results.length) return { results: [], debug: "encontrado, mas sem campo de status preenchido" };
     return { results, debug: "ok" };
   } catch (e) {
+    console.error(`[check-part] Digi-Key falhou para "${pn}":`, e.message);
     return { results: [], debug: `erro: ${e.message}` };
   }
 }
@@ -729,48 +746,55 @@ function compareCandidates(a, b) {
   return 0;
 }
 
-exports.handler = async (event) => {
+// "*" deixava qualquer site do mundo chamar esta função pelo navegador de
+// quem estivesse com a página aberta — e cada chamada bate em APIs pagas com
+// cota limitada (Mouser/Farnell/Digi-Key/TrustedParts). Travar num domínio
+// não impede chamada direta via curl/script (CORS é aplicado pelo navegador,
+// não pelo servidor), mas fecha o vetor de abuso via browser.
+//
+// Como o domínio final só se sabe após o 1º deploy (subdomínio *.pages.dev
+// ou domínio próprio), isso é configurável via env var ALLOWED_ORIGIN — sem
+// isso, cai no default abaixo, que PRECISA ser atualizado depois do deploy.
+const DEFAULT_ALLOWED_ORIGIN = "https://obscomp2026.pages.dev";
+
+export async function onRequest(context) {
+  const { request, env } = context;
   const cors = {
-    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Origin": env.ALLOWED_ORIGIN || DEFAULT_ALLOWED_ORIGIN,
     "Access-Control-Allow-Headers": "Content-Type",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Content-Type": "application/json",
   };
 
-  if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: cors, body: "" };
-  if (event.httpMethod !== "POST")
-    return { statusCode: 405, headers: cors, body: JSON.stringify({ error: "Método não permitido" }) };
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+  if (request.method !== "POST")
+    return new Response(JSON.stringify({ error: "Método não permitido" }), { status: 405, headers: cors });
 
   let pn, mfr;
   try {
-    ({ pn, mfr } = JSON.parse(event.body || "{}"));
+    const bodyText = await request.text();
+    ({ pn, mfr } = JSON.parse(bodyText || "{}"));
   } catch {
-    return { statusCode: 400, headers: cors, body: JSON.stringify({ error: "Corpo inválido" }) };
+    return new Response(JSON.stringify({ error: "Corpo inválido" }), { status: 400, headers: cors });
   }
   if (!pn || !pn.trim())
-    return { statusCode: 400, headers: cors, body: JSON.stringify({ error: "Part number ausente" }) };
+    return new Response(JSON.stringify({ error: "Part number ausente" }), { status: 400, headers: cors });
 
   const trimmedPn = pn.trim();
 
-  if (
-    !process.env.MOUSER_API_KEY &&
-    !process.env.FARNELL_API_KEY &&
-    !process.env.TRUSTEDPARTS_API_KEY &&
-    !process.env.DIGIKEY_CLIENT_ID
-  ) {
-    return {
-      statusCode: 500,
-      headers: cors,
-      body: JSON.stringify({ error: "Nenhuma fonte configurada no servidor." }),
-    };
+  if (!env.MOUSER_API_KEY && !env.FARNELL_API_KEY && !env.TRUSTEDPARTS_API_KEY && !env.DIGIKEY_CLIENT_ID) {
+    return new Response(
+      JSON.stringify({ error: "Nenhuma fonte configurada no servidor." }),
+      { status: 500, headers: cors }
+    );
   }
 
   try {
     const [mouserOut, farnellOut, tpOut, dkOut] = await Promise.all([
-      queryMouser(trimmedPn, mfr),
-      queryFarnell(trimmedPn, mfr),
-      queryTrustedParts(trimmedPn, mfr),
-      queryDigiKey(trimmedPn, mfr),
+      queryMouser(trimmedPn, mfr, env),
+      queryFarnell(trimmedPn, mfr, env),
+      queryTrustedParts(trimmedPn, mfr, env),
+      queryDigiKey(trimmedPn, mfr, env),
     ]);
 
     const outs = [
@@ -787,10 +811,8 @@ exports.handler = async (event) => {
     const diagSuffix = diagnostics.length ? ` [${diagnostics.join(" | ")}]` : "";
 
     if (!allResults.length) {
-      return {
-        statusCode: 200,
-        headers: cors,
-        body: JSON.stringify({
+      return new Response(
+        JSON.stringify({
           status: "unknown",
           confidence: "low",
           substitute: "",
@@ -798,7 +820,8 @@ exports.handler = async (event) => {
           notes: `Componente não encontrado nas bases consultadas. Verificação manual necessária.${diagSuffix}`,
           sources: [],
         }),
-      };
+        { status: 200, headers: cors }
+      );
     }
 
     const candidates = groupByManufacturer(allResults)
@@ -816,10 +839,8 @@ exports.handler = async (event) => {
       notes += ` Este PN também é feito por: ${others} — informe o fabricante para focar em um só.`;
     }
 
-    return {
-      statusCode: 200,
-      headers: cors,
-      body: JSON.stringify({
+    return new Response(
+      JSON.stringify({
         status: primary.status,
         confidence: primary.confidence,
         substitute: primary.substitute,
@@ -830,8 +851,13 @@ exports.handler = async (event) => {
         ambiguous: primary.ambiguous,
         candidates: candidates.length > 1 ? candidates : undefined,
       }),
-    };
+      { status: 200, headers: cors }
+    );
   } catch (err) {
-    return { statusCode: 500, headers: cors, body: JSON.stringify({ error: err.message || "Erro interno" }) };
+    console.error(`[check-part] Erro interno inesperado para "${trimmedPn}":`, err.stack || err.message);
+    return new Response(
+      JSON.stringify({ error: err.message || "Erro interno" }),
+      { status: 500, headers: cors }
+    );
   }
-};
+}

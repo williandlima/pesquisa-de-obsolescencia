@@ -1,4 +1,4 @@
-// Servidor de teste: serve public/ e finge ser a Netlify Function /api/check-part.
+// Servidor de teste: serve public/ e finge ser a função /api/check-part.
 // Registra tudo que o frontend envia, para provarmos o que chega (ou não chega) no backend.
 const http = require("http");
 const fs = require("fs");

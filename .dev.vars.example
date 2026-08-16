@@ -1,0 +1,13 @@
+# Copie para .dev.vars (nunca commitado) para testar localmente com
+# `wrangler pages dev public`. Todas são opcionais, mas precisa de pelo
+# menos uma para o backend responder.
+MOUSER_API_KEY=
+FARNELL_API_KEY=
+TRUSTEDPARTS_API_KEY=
+TRUSTEDPARTS_COMPANY_ID=
+DIGIKEY_CLIENT_ID=
+DIGIKEY_CLIENT_SECRET=
+
+# Opcional — domínio liberado no CORS da função. Sem isso, usa o default
+# hardcoded em functions/api/check-part.js (DEFAULT_ALLOWED_ORIGIN).
+ALLOWED_ORIGIN=http://localhost:8788

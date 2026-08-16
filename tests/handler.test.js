@@ -31,11 +31,33 @@ function makeFetch(routes, log = []) {
   };
 }
 
+// Constrói um Request real (Fetch API nativa do Node) e chama onRequest com
+// a mesma forma de EventContext que o Cloudflare Pages Functions usa em
+// produção — { request, env } — em vez do event/context estilo Netlify.
+async function callRaw({ env = {}, method = "POST", rawBody, fetchImpl }) {
+  const { onRequest } = loadFunction({
+    fetchImpl: fetchImpl || (async () => { throw new Error("fetch não stubado"); }),
+  });
+  const request = new Request("http://localhost/api/check-part", {
+    method,
+    body: rawBody === undefined ? undefined : rawBody,
+  });
+  const res = await onRequest({ request, env });
+  const text = await res.text();
+  let parsed = null;
+  try { parsed = text ? JSON.parse(text) : null; } catch {}
+  return { res, parsed, text };
+}
+
 async function invoke({ env, routes, body }) {
   const log = [];
-  const { handler } = loadFunction({ env, fetchImpl: makeFetch(routes, log) });
-  const res = await handler({ httpMethod: "POST", body: JSON.stringify(body) });
-  return { res, parsed: JSON.parse(res.body), log };
+  const { res, parsed } = await callRaw({
+    env,
+    method: "POST",
+    rawBody: JSON.stringify(body),
+    fetchImpl: makeFetch(routes, log),
+  });
+  return { res, parsed, log };
 }
 
 (async () => {
@@ -154,18 +176,25 @@ async function invoke({ env, routes, body }) {
 
   console.log("\n== handler: nenhuma fonte configurada ==");
   {
-    const { handler } = loadFunction({ env: {}, fetchImpl: async () => jsonRes({}) });
-    const res = await handler({ httpMethod: "POST", body: JSON.stringify({ pn: "X" }) });
-    check("500 com mensagem clara", [res.statusCode, JSON.parse(res.body).error], [500, "Nenhuma fonte configurada no servidor."]);
+    const { res, parsed } = await callRaw({
+      env: {},
+      method: "POST",
+      rawBody: JSON.stringify({ pn: "X" }),
+      fetchImpl: async () => jsonRes({}),
+    });
+    check("500 com mensagem clara", [res.status, parsed.error], [500, "Nenhuma fonte configurada no servidor."]);
   }
 
   console.log("\n== handler: robustez de entrada ==");
   {
-    const { handler } = loadFunction({ env: { MOUSER_API_KEY: "k" }, fetchImpl: async () => jsonRes({}) });
-    check("OPTIONS => 204", (await handler({ httpMethod: "OPTIONS" })).statusCode, 204);
-    check("GET => 405", (await handler({ httpMethod: "GET" })).statusCode, 405);
-    check("body inválido => 400", (await handler({ httpMethod: "POST", body: "{{{" })).statusCode, 400);
-    check("pn vazio => 400", (await handler({ httpMethod: "POST", body: '{"pn":"  "}' })).statusCode, 400);
+    const stubEnv = { MOUSER_API_KEY: "k" };
+    const stubFetch = async () => jsonRes({});
+    check("OPTIONS => 204", (await callRaw({ env: stubEnv, method: "OPTIONS", fetchImpl: stubFetch })).res.status, 204);
+    check("GET => 405", (await callRaw({ env: stubEnv, method: "GET", fetchImpl: stubFetch })).res.status, 405);
+    check("body inválido => 400",
+      (await callRaw({ env: stubEnv, method: "POST", rawBody: "{{{", fetchImpl: stubFetch })).res.status, 400);
+    check("pn vazio => 400",
+      (await callRaw({ env: stubEnv, method: "POST", rawBody: '{"pn":"  "}', fetchImpl: stubFetch })).res.status, 400);
   }
 
   console.log("\n== handler: resposta não-JSON (HTML de erro) ==");
@@ -237,7 +266,7 @@ async function invoke({ env, routes, body }) {
     });
     info(`notas: ${parsed.notes.slice(parsed.notes.indexOf("DigiKey"))}`);
     check("aponta só o DIGIKEY_CLIENT_SECRET",
-      /DigiKey: falta a variável de ambiente DIGIKEY_CLIENT_SECRET no Netlify/.test(parsed.notes), true);
+      /DigiKey: falta a variável de ambiente DIGIKEY_CLIENT_SECRET no Cloudflare Pages/.test(parsed.notes), true);
     check("não cita o CLIENT_ID, que está presente",
       /DIGIKEY_CLIENT_ID/.test(parsed.notes), false);
   }
@@ -298,7 +327,7 @@ async function invoke({ env, routes, body }) {
     check("lead time real continua aparecendo", /Lead time: 84 Dias/.test(parsed.notes), true);
   }
 
-  console.log("\n== handler: latência / timeout (limite de 10s da Netlify) ==");
+  console.log("\n== handler: latência / timeout (orçamento de UX, sem teto de plataforma) ==");
   {
     const slow = () => new Promise((r) => setTimeout(() => r(jsonRes(mouserBody([]))), 3000));
     const t0 = Date.now();
@@ -309,7 +338,7 @@ async function invoke({ env, routes, body }) {
     });
     const elapsed = Date.now() - t0;
     info(`fonte lenta (3s/req): handler levou ${elapsed}ms, status=${parsed.status}`);
-    check("handler deveria abortar antes de 10s (limite Netlify)", elapsed < 10000, true);
+    check("handler não fica preso indefinidamente numa fonte lenta", elapsed < 10000, true);
   }
 
   console.log("\n== handler: fonte pendurada (sem resposta) ==");
@@ -334,13 +363,14 @@ async function invoke({ env, routes, body }) {
       ],
       body: { pn: "X" },
     });
-    // O contrato é caber nos 10s da Netlify com folga, não ser instantâneo: o
-    // teto é generoso de propósito para não descartar fonte lenta que funciona.
+    // O contrato é caber no orçamento (SOURCE_DEADLINE_MS) com folga, não ser
+    // instantâneo: o teto é generoso de propósito para não descartar fonte
+    // lenta que funciona — não existe mais um teto de plataforma a respeitar.
     const LIMITE_MS = 9000;
     const race = await Promise.race([done, new Promise((r) => setTimeout(() => r("TIMEOUT"), LIMITE_MS))]);
     if (race === "TIMEOUT") {
       fail++;
-      console.log(`  FAIL fonte pendurada levou o handler além de ${LIMITE_MS}ms (a Netlify mata em 10s)`);
+      console.log(`  FAIL fonte pendurada levou o handler além de ${LIMITE_MS}ms`);
     } else {
       pass++;
       console.log(`  ok   fonte pendurada abortada e as outras entregaram (${Date.now() - t0}ms)`);
