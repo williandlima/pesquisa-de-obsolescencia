@@ -122,6 +122,44 @@ function info(m) { console.log(`  info  ${m}`); }
   check("registro antigo recebe alerta visual", /⚠\s*\d+d/.test(linhas[0]), true);
   check("registro de hoje não recebe alerta", /⚠\s*\d+d/.test(linhas[1]), false);
 
+  console.log("\n== H. Backup completo (.json): exporta e restaura ==");
+  const [backupDownload] = await Promise.all([
+    page.waitForEvent("download", { timeout: 15000 }),
+    page.click("text=Baixar backup completo"),
+  ]);
+  check("nome do arquivo de backup", /^backup_obsolescencia_.*\.json$/.test(backupDownload.suggestedFilename()), true);
+  const backupPath = require("path").join(__dirname, "out_" + backupDownload.suggestedFilename());
+  await backupDownload.saveAs(backupPath);
+  const backupJson = JSON.parse(require("fs").readFileSync(backupPath, "utf8"));
+  info(`backup contém ${backupJson.entries.length} registro(s), versão ${backupJson.version}`);
+  check("backup guarda os 2 registros do log", backupJson.entries.length, 2);
+  check("backup preserva o PN cru (sem formatação de exibição)",
+    backupJson.entries.map((e) => e.pn).sort(), ["NOVO", "VELHO"]);
+
+  console.log("\n== I. Restaurar backup depois de limpar o navegador ==");
+  await page.evaluate(() => localStorage.clear());
+  await page.reload();
+  await page.waitForTimeout(200);
+  check("log vazio após limpar localStorage", await page.locator("#logBody .empty-row").count(), 1);
+
+  await page.setInputFiles("#backupFile", { name: "backup.json", mimeType: "application/json", buffer: require("fs").readFileSync(backupPath) });
+  await page.waitForTimeout(300);
+  check("os 2 registros voltam após restaurar", await page.locator("#logBody tr").count(), 2);
+  check("status do backupStatus confirma a restauração",
+    /2 registro\(s\) restaurado/.test(await page.textContent("#backupStatus")), true);
+
+  console.log("\n== J. Restaurar backup NÃO duplica (dedupa por PN+fabricante) ==");
+  await page.setInputFiles("#backupFile", { name: "backup.json", mimeType: "application/json", buffer: require("fs").readFileSync(backupPath) });
+  await page.waitForTimeout(300);
+  check("restaurar o mesmo backup 2x não duplica linhas", await page.locator("#logBody tr").count(), 2);
+
+  console.log("\n== K. Backup com JSON inválido é rejeitado com mensagem clara ==");
+  await page.setInputFiles("#backupFile", { name: "lixo.json", mimeType: "application/json", buffer: Buffer.from("{ isso não é json") });
+  await page.waitForTimeout(200);
+  info(`mensagem: ${await page.textContent("#backupStatus")}`);
+  check("avisa que o arquivo é inválido", /não é um JSON legível/.test(await page.textContent("#backupStatus")), true);
+  check("log permanece intacto (não apagou nada)", await page.locator("#logBody tr").count(), 2);
+
   console.log(`\n----- frontend (parte 2): ${pass} ok, ${fail} falhas -----`);
   await browser.close(); server.close(); process.exit(0);
 })().catch((e) => { console.error("ERRO:", e); process.exit(1); });

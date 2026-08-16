@@ -4,5 +4,4 @@ node_modules/
 .env.*
 !.env.example
 *.log
-tests/out_*.csv
-tests/out_*.xlsx
+tests/out_*

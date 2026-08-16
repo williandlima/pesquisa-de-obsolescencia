@@ -291,6 +291,9 @@
     color:var(--copper-bright);
   }
   .btn-secondary:hover{background:rgba(193,127,74,0.12);}
+  .backup-row{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:18px;}
+  .file-btn{display:inline-flex; align-items:center; cursor:pointer; margin:0;}
+  .file-btn input{display:none;}
 
   table{width:100%; border-collapse:collapse; margin-top:6px; font-size:12.5px;}
   th{
@@ -548,7 +551,16 @@
 
     <div class="log-panel">
       <h2>Log de obsolescência</h2>
-      <p class="sub">Registre manualmente o que você encontrou em cada fonte. Fica salvo neste navegador entre sessões — sem servidor, sem conta.</p>
+      <p class="sub">Registre manualmente o que você encontrou em cada fonte. Fica salvo neste navegador entre sessões — sem servidor, sem conta. <strong style="color:var(--silk);">Sem backup, um navegador limpo apaga tudo</strong> — baixe o backup periodicamente.</p>
+
+      <div class="backup-row">
+        <button type="button" class="btn-secondary" onclick="exportLogBackup()">Baixar backup completo (.json)</button>
+        <label class="btn-secondary file-btn" for="backupFile">
+          Restaurar backup
+          <input type="file" id="backupFile" accept="application/json,.json" onchange="handleBackupFile(event)">
+        </label>
+        <span id="backupStatus" role="status" aria-live="polite" style="font-family:var(--mono); font-size:11.5px; color:var(--silk-dim);"></span>
+      </div>
 
       <div class="log-form">
         <div>
@@ -1239,6 +1251,82 @@ function exportLogToCSV(entries){
   a.click();
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ---- Backup completo do log (JSON) ----
+// Diferente do relatório em Excel/CSV (formatado para leitura humana), este
+// backup guarda os campos brutos e pode ser reimportado — hoje é a única
+// forma de não perder o log se o navegador for trocado ou o localStorage
+// for limpo, já que o log vive só nesse armazenamento local.
+function exportLogBackup(){
+  loadLog().then(entries => {
+    if(!entries.length){
+      alert('O log está vazio. Nada para fazer backup ainda.');
+      return;
+    }
+    const payload = {
+      app: 'rastreador-obsolescencia',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      entries
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `backup_obsolescencia_${todayStr().replace(/\//g,'-')}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+}
+
+async function handleBackupFile(event){
+  const file = event.target.files[0];
+  const statusEl = document.getElementById('backupStatus');
+  event.target.value = ''; // permite escolher o mesmo arquivo de novo depois, se precisar
+  if(!file) return;
+
+  const reader = new FileReader();
+  reader.onload = async function(e){
+    let payload;
+    try{
+      payload = JSON.parse(e.target.result);
+    }catch(err){
+      statusEl.style.color = 'var(--led-red)';
+      statusEl.textContent = 'Arquivo inválido: não é um JSON legível.';
+      return;
+    }
+
+    const incoming = Array.isArray(payload) ? payload : payload.entries;
+    if(!Array.isArray(incoming)){
+      statusEl.style.color = 'var(--led-red)';
+      statusEl.textContent = 'Arquivo inválido: não parece um backup deste app.';
+      return;
+    }
+
+    // Só aceita registros com o mínimo para serem úteis — evita corromper o
+    // log com lixo de um arquivo editado à mão ou de outra ferramenta.
+    const valid = incoming.filter(en => en && typeof en.pn === 'string' && en.pn.trim() && typeof en.status === 'string');
+    if(!valid.length){
+      statusEl.style.color = 'var(--led-red)';
+      statusEl.textContent = 'Nenhum registro válido encontrado no arquivo.';
+      return;
+    }
+
+    // upsertLogEntry dedupa por PN+fabricante — restaurar o mesmo backup
+    // duas vezes não duplica linha, só atualiza.
+    let entries = await loadLog();
+    valid.forEach(en => { entries = upsertLogEntry(entries, en); });
+    await saveLog(entries);
+    renderLog(entries);
+
+    const skipped = incoming.length - valid.length;
+    statusEl.style.color = 'var(--led-green)';
+    statusEl.textContent = `${valid.length} registro(s) restaurado(s)${skipped ? ` — ${skipped} ignorado(s) por estar incompleto` : ''}.`;
+  };
+  reader.readAsText(file);
 }
 
 function runSearch(){

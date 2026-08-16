@@ -101,9 +101,11 @@ disponível. Todo push e PR roda a suíte inteira via GitHub Actions
 ## Segurança
 
 - Credenciais nunca vão ao navegador — ficam só nas variáveis de ambiente do Netlify.
-- O log fica no `localStorage` do navegador de cada usuário (não há banco central,
-  então também não há como recuperar o log se o navegador for trocado ou o
-  armazenamento local for limpo — exporte para Excel com frequência).
+- O log fica no `localStorage` do navegador de cada usuário — não há banco central,
+  não sincroniza entre pessoas ou dispositivos. Use "Baixar backup completo (.json)"
+  no painel do log com frequência; "Restaurar backup" recria o log a partir desse
+  arquivo (dedupa por PN + fabricante, então restaurar 2x não duplica linha). O
+  relatório em Excel/CSV é só leitura humana — não serve para restaurar o log.
 - Apenas URLs `http`/`https` viram links clicáveis no log.
 - `Access-Control-Allow-Origin` da função é travado no domínio do app — outros sites
   não conseguem usar o navegador de um visitante para chamar `/api/check-part` e

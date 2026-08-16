@@ -1,14 +1,15 @@
 # Testes
 
 ```bash
-node tests/run.js            # tudo
+npm test                     # tudo (equivalente a node tests/run.js)
 node tests/run.js backend    # só backend (nenhuma dependência)
-node tests/run.js frontend   # só frontend (precisa de Playwright)
+node tests/run.js frontend   # só frontend (precisa de Playwright — `npm install` traz)
 ```
 
-Sem framework e sem `package.json`: o projeto não tem build step, e os testes
-seguem a mesma regra. Cada arquivo imprime `ok` / `FAIL` por asserção e uma
-linha de total que o `run.js` agrega.
+Sem framework de teste: o projeto não tem build step, e os testes seguem a mesma
+regra. Cada arquivo imprime `ok` / `FAIL` por asserção e uma linha de total que o
+`run.js` agrega. O `package.json` existe só para declarar o Playwright como
+devDependency e dar scripts padrão — CI roda via `.github/workflows/test.yml`.
 
 ## O que cada arquivo cobre
 
@@ -17,7 +18,7 @@ linha de total que o `run.js` agrega.
 | `backend.test.js` | `normalizeStatus` contra os rótulos reais de Mouser, Digi-Key, TI, ST e Microchip; `manufacturerMatches` (filtro) vs. `manufacturersEqual` (agrupamento); `pickManufacturerCandidates`, `compareCandidates` e votação/confiança do `combine`. |
 | `handler.test.js` | O handler inteiro com `fetch` mockado: concordância, divergência, filtro por fabricante, fabricantes diferentes viram candidatos separados, degradação graciosa, respostas HTML de erro, orçamento de tempo e fonte pendurada. |
 | `frontend.test.js` | A página real num Chromium contra um backend falso: verificação individual, envio do fabricante, log, persistência, batch, deduplicação, importação de CSV, exportação e sanitização de XSS. |
-| `frontend2.test.js` | Casos de borda: CSV com aspas, CSV com `;` (Excel pt-BR), coluna de fabricante, fallback do export sem CDN, cancelamento do batch e alerta de dado velho. |
+| `frontend2.test.js` | Casos de borda: CSV com aspas, CSV com `;` (Excel pt-BR), coluna de fabricante, fallback do export sem CDN, cancelamento do batch, alerta de dado velho, e backup/restauração completa do log em JSON (export, restore após limpar o navegador, dedup ao restaurar 2x, rejeição de arquivo inválido). |
 | `frontend3.test.js` | PN com vários fabricantes: chips de candidato, troca sem nova chamada à API, "Usar no log" gravando o candidato selecionado (não sempre o primário), e ausência de chips quando só há 1 fabricante. |
 
 ## Como o backend é carregado
