@@ -779,7 +779,7 @@ const SOURCES = (pn, mfr) => {
 };
 
 async function checkPartNumberViaAPI(pn, mfr){
-  // Chama a função serverless (Netlify), que cruza Mouser, Farnell/Newark,
+  // Chama a Cloudflare Pages Function, que cruza Mouser, Farnell/Newark,
   // TrustedParts e Digi-Key. Nenhuma credencial trafega pelo navegador.
   // O fabricante precisa ir junto: é ele que impede confundir o mesmo PN
   // entre fabricantes diferentes (LM317T da TI x onsemi x ST).

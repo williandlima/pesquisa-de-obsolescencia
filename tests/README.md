@@ -23,10 +23,17 @@ devDependency e dar scripts padrão — CI roda via `.github/workflows/test.yml`
 
 ## Como o backend é carregado
 
-`load.js` lê `netlify/functions/check-part.js` e o executa num contexto isolado
-(`vm`), injetando `process.env` e um `fetch` falso, e expondo as funções internas
-que a produção não exporta. Assim os testes exercitam o arquivo de produção sem
-que ele precise de código de teste dentro dele.
+`load.js` lê `functions/api/check-part.js` e o executa num contexto isolado
+(`vm`), injetando um `fetch` falso e expondo as funções internas que a produção
+não exporta. Como o arquivo de produção usa `export` (exigido pelo runtime do
+Cloudflare Pages Functions) e `vm.Script` roda como script comum, não módulo,
+`load.js` troca a declaração `export async function onRequest` por uma
+declaração normal antes de rodar — se essa string mudar no arquivo de produção
+e o `load.js` não for atualizado junto, ele falha alto (propositalmente) em vez
+de testar uma cópia velha em silêncio. `handler.test.js` chama `onRequest`
+com um `Request` de verdade (Fetch API nativa do Node) e um objeto `env`,
+espelhando exatamente a forma `{ request, env }` que o Cloudflare passa em
+produção — nada de `process.env`.
 
 ## Como o frontend é servido
 
@@ -40,4 +47,5 @@ o que o frontend realmente envia ao backend (e não só o que a tela mostra).
   carrega nesse ambiente — o que é proposital: exercita o caminho de fallback para
   CSV, o mesmo que um usuário atrás de firewall corporativo enfrenta.
 - Nenhum teste chama API de distribuidor de verdade. Para validar chave nova,
-  teste contra o ambiente do Netlify.
+  teste com `wrangler pages dev public` (usa `.dev.vars` local) ou contra o
+  deploy real no Cloudflare Pages.

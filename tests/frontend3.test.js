@@ -1,4 +1,5 @@
-const { chromium } = require("./playwright-loader").load();
+const { load, launchOptions } = require("./playwright-loader");
+const { chromium } = load();
 const { start, requests } = require("./server");
 
 const PORT = 8793;
@@ -12,7 +13,7 @@ function info(m) { console.log(`  info  ${m}`); }
 
 (async () => {
   const server = await start(PORT);
-  const browser = await chromium.launch();
+  const browser = await chromium.launch(launchOptions());
   const page = await (await browser.newContext()).newPage();
 
   await page.goto(`http://127.0.0.1:${PORT}/`);

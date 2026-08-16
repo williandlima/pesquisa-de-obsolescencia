@@ -1,0 +1,15 @@
+name = "rastreador-obsolescencia"
+compatibility_date = "2026-08-01"
+pages_build_output_dir = "public"
+
+# Sem build step: o site é estático (public/) + Cloudflare Pages Functions
+# (functions/api/check-part.js), roteadas automaticamente por diretório.
+#
+# Variáveis de ambiente e secrets NÃO ficam aqui — configure em
+# Settings → Variables and Secrets no dashboard do Cloudflare Pages (ou via
+# `wrangler pages secret put NOME_DA_VAR`). Use "Secret" para as chaves de
+# API (MOUSER_API_KEY, FARNELL_API_KEY, etc.) — diferente de "Variável de
+# texto", secrets não podem ser lidos de volta depois de criados.
+#
+# Para dev local, crie um arquivo `.dev.vars` (nunca versionado — ver
+# .dev.vars.example) e rode `wrangler pages dev public`.

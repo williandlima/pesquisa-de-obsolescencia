@@ -2,6 +2,29 @@
 // Este loader procura o pacote onde ele costuma estar (local ou global) e
 // avisa de forma clara quando não encontra, em vez de estourar um require.
 const { execSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+
+// Em ambientes com Chromium pré-instalado fora do cache padrão do Playwright
+// (comum em sandboxes/CI que proíbem download de browser no `npm install`),
+// o pacote local pode ficar sem nenhum binário compatível — ver
+// PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD. Acha o chrome pré-instalado e devolve o
+// executablePath pronto pra passar em chromium.launch({ ...launchOptions() }).
+// Sem achar nada, devolve {} e deixa o Playwright resolver do jeito normal.
+function launchOptions() {
+  const base = process.env.PLAYWRIGHT_BROWSERS_PATH;
+  const roots = [base, "/opt/pw-browsers"].filter(Boolean);
+  for (const root of roots) {
+    if (!fs.existsSync(root)) continue;
+    let entries;
+    try { entries = fs.readdirSync(root); } catch (e) { continue; }
+    const dir = entries.find((d) => /^chromium-\d+$/.test(d));
+    if (!dir) continue;
+    const exe = path.join(root, dir, "chrome-linux", "chrome");
+    if (fs.existsSync(exe)) return { executablePath: exe };
+  }
+  return {};
+}
 
 function candidates() {
   const list = ["playwright", "@playwright/test"];
@@ -34,4 +57,4 @@ function load() {
   return pw;
 }
 
-module.exports = { load, available: () => tryLoad() !== null };
+module.exports = { load, available: () => tryLoad() !== null, launchOptions };

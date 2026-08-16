@@ -1,4 +1,5 @@
-const { chromium } = require("./playwright-loader").load();
+const { load, launchOptions } = require("./playwright-loader");
+const { chromium } = load();
 const { start } = require("./server");
 
 const PORT = 8792;
@@ -12,7 +13,7 @@ function info(m) { console.log(`  info  ${m}`); }
 
 (async () => {
   const server = await start(PORT);
-  const browser = await chromium.launch();
+  const browser = await chromium.launch(launchOptions());
   const page = await (await browser.newContext()).newPage();
   const errs = [];
   page.on("pageerror", (e) => errs.push(e.message));
