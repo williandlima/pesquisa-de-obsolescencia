@@ -437,6 +437,40 @@ async function invoke({ env, routes, body }) {
     check("Mouser continua funcionando normalmente", parsed.status, "active");
   }
 
+  console.log("\n== handler: notas não repetem jargão técnico (regra de clareza pro usuário) ==");
+  {
+    // releaseStatusCode é um detalhe interno da Farnell — nunca deve vazar
+    // pras notas mostradas pro usuário.
+    const { parsed } = await invoke({
+      env: { FARNELL_API_KEY: "f" },
+      routes: [["element14", () => jsonRes({
+        manufacturerPartNumberSearchReturn: {
+          products: [{ translatedManufacturerPartNumber: "X", vendorName: "onsemi", releaseStatusCode: 4 }],
+        },
+      })]],
+      body: { pn: "X" },
+    });
+    info(`notas: ${parsed.notes}`);
+    check("não vaza 'releaseStatusCode' pro usuário", /releaseStatusCode/.test(parsed.notes), false);
+    check("fonte única vira frase clara, não 'Lifecycle: \"x\"'", /^Confirmado por apenas 1 fonte/.test(parsed.notes), true);
+    check("recomenda checagem manual quando só 1 fonte confirma",
+      /recomendável checar manualmente/.test(parsed.notes), true);
+  }
+  {
+    const { parsed } = await invoke({
+      env: { MOUSER_API_KEY: "k", DIGIKEY_CLIENT_ID: "id", DIGIKEY_CLIENT_SECRET: "sec" },
+      routes: [
+        ["api.mouser.com", () => jsonRes(mouserBody([
+          { ManufacturerPartNumber: "X", Manufacturer: "TI", LifecycleStatus: "Obsolete" }]))],
+        ["oauth2/token", () => jsonRes({ access_token: "t", expires_in: 600 })],
+        ["digikey.com/products", () => jsonRes(dkBody([
+          { ManufacturerProductNumber: "X", Manufacturer: { Name: "TI" }, ProductStatus: { Status: "Obsolete" } }]))],
+      ],
+      body: { pn: "X" },
+    });
+    check("2 fontes concordando vira frase clara", /^Confirmado por 2 fontes independentes/.test(parsed.notes), true);
+  }
+
   console.log("\n== handler: latência / timeout (orçamento de UX, sem teto de plataforma) ==");
   {
     const slow = () => new Promise((r) => setTimeout(() => r(jsonRes(mouserBody([]))), 3000));

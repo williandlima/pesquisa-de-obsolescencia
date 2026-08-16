@@ -319,10 +319,18 @@ async function queryFarnell(pn, mfr, env) {
     );
     const pool = pnExact.length ? pnExact : root.products;
 
+    // A Farnell não manda um texto de status — só um código numérico interno
+    // (releaseStatusCode). Traduzimos pra um rótulo legível aqui mesmo, pra
+    // "releaseStatusCode 4" nunca vazar pro usuário final nas notas.
     const codeMap = { "4": "active", "6": "nrnd", "7": "obsolete" };
+    const CODE_LABEL = {
+      "4": "Active (código de status da Farnell)",
+      "6": "NRND (código de status da Farnell)",
+      "7": "Obsolete (código de status da Farnell)",
+    };
     const deriveStatus = (p) => {
       if (p.releaseStatusCode !== undefined && codeMap[String(p.releaseStatusCode)]) {
-        return { status: codeMap[String(p.releaseStatusCode)], rawStatus: `releaseStatusCode ${p.releaseStatusCode}` };
+        return { status: codeMap[String(p.releaseStatusCode)], rawStatus: CODE_LABEL[String(p.releaseStatusCode)] };
       }
       if (p.productStatus) return { status: normalizeStatus(p.productStatus), rawStatus: p.productStatus };
       return { status: "unknown", rawStatus: "" };
@@ -1052,14 +1060,20 @@ function buildCandidate(items) {
   // prazo de zero dia — anunciá-lo numa peça obsoleta induz ao erro.
   const leadTime = items.find((r) => r.leadTime && !/^0\s*\D*$/.test(String(r.leadTime).trim()))?.leadTime || "";
   const perSource = items.map((r) => `${r.source}: ${r.rawStatus || r.status}`).join("; ");
+  const leadTimeSuffix = leadTime ? ` Lead time: ${leadTime}.` : "";
 
+  // A tag de status/confiança e o fabricante já aparecem destacados na tela
+  // (e em colunas próprias no log) — repeti-los aqui em "Lifecycle: "x" — Y"
+  // só duplicava informação em formato de depuração. As notas agora focam no
+  // que a tag não mostra: quantas fontes concordam e o motivo de confiar
+  // mais ou menos nisso, em frase direta.
   let notes;
   if (combined.status === "unknown") {
-    notes = `${combined.note || "Não conclusivo."} Fontes: ${perSource}.${leadTime ? " Lead time: " + leadTime + "." : ""}`;
+    notes = `${combined.note || "Não conclusivo."} Fontes consultadas: ${perSource}.${leadTimeSuffix}`;
+  } else if (combined.agreeing > 1) {
+    notes = `Confirmado por ${combined.agreeing} fontes independentes: ${perSource}.${leadTimeSuffix}`;
   } else {
-    const agree =
-      combined.agreeing > 1 ? ` — ${combined.agreeing} fontes independentes concordam` : ` — fonte única`;
-    notes = `Lifecycle: "${combined.status}"${manufacturer ? " — " + manufacturer : ""}${agree} (${perSource}).${leadTime ? " Lead time: " + leadTime + "." : ""}`;
+    notes = `Confirmado por apenas 1 fonte (${perSource}) — recomendável checar manualmente antes de decidir.${leadTimeSuffix}`;
   }
 
   return {
