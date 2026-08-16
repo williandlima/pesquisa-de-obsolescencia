@@ -327,6 +327,116 @@ async function invoke({ env, routes, body }) {
     check("lead time real continua aparecendo", /Lead time: 84 Dias/.test(parsed.notes), true);
   }
 
+  console.log("\n== handler: Octopart/Nexar (GraphQL + OAuth2) ==");
+  {
+    const nexarBody = {
+      data: {
+        supSearchMpn: {
+          results: [
+            {
+              part: {
+                mpn: "LM317T",
+                manufacturer: { name: "Texas Instruments" },
+                lifecycleStatus: "Active",
+                octopartUrl: "https://octopart.com/lm317t",
+              },
+            },
+          ],
+        },
+      },
+    };
+    const { parsed } = await invoke({
+      env: { NEXAR_CLIENT_ID: "id", NEXAR_CLIENT_SECRET: "sec" },
+      routes: [
+        ["identity.nexar.com", () => jsonRes({ access_token: "t", expires_in: 600 })],
+        ["api.nexar.com/graphql", () => jsonRes(nexarBody)],
+      ],
+      body: { pn: "LM317T" },
+    });
+    check("Nexar sozinho => active/medium", [parsed.status, parsed.confidence], ["active", "medium"]);
+    check("fabricante propagado do GraphQL", parsed.manufacturer, "Texas Instruments");
+  }
+  {
+    // Erro GraphQL (data.errors) não deve derrubar a função, só virar debug.
+    const { parsed } = await invoke({
+      env: { MOUSER_API_KEY: "k", NEXAR_CLIENT_ID: "id", NEXAR_CLIENT_SECRET: "sec" },
+      routes: [
+        ["api.mouser.com", () => jsonRes(mouserBody([
+          { ManufacturerPartNumber: "X", Manufacturer: "TI", LifecycleStatus: "Active" }]))],
+        ["identity.nexar.com", () => jsonRes({ access_token: "t", expires_in: 600 })],
+        ["api.nexar.com/graphql", () => jsonRes({ errors: [{ message: "rate limit exceeded" }] })],
+      ],
+      body: { pn: "X" },
+    });
+    check("erro GraphQL não derruba Mouser", parsed.status, "active");
+    check("erro GraphQL aparece nas notas", /Octopart\/Nexar:.*rate limit exceeded/.test(parsed.notes), true);
+  }
+
+  console.log("\n== handler: Arrow Electronics (login+apikey) ==");
+  {
+    const { parsed } = await invoke({
+      env: { ARROW_LOGIN: "user", ARROW_API_KEY: "k" },
+      routes: [["api.arrow.com", () => jsonRes({
+        searchTokenResult: { items: [
+          { partNum: "LM317T", mfrName: "Texas Instruments", reachStatus: "Active", productUrl: "https://arrow.com/lm317t" },
+        ] },
+      })]],
+      body: { pn: "LM317T" },
+    });
+    check("Arrow sozinho => active/medium", [parsed.status, parsed.confidence], ["active", "medium"]);
+    check("fabricante propagado da Arrow", parsed.manufacturer, "Texas Instruments");
+  }
+
+  console.log("\n== handler: Avnet (OAuth2 + subscription key) ==");
+  {
+    const { parsed } = await invoke({
+      env: { AVNET_CLIENT_ID: "id", AVNET_CLIENT_SECRET: "sec", AVNET_SUBSCRIPTION_KEY: "sub" },
+      routes: [
+        ["api.avnet.com/oauth/token", () => jsonRes({ access_token: "t", expires_in: 600 })],
+        ["products/search", () => jsonRes({ products: [
+          { partNumber: "LM317T", manufacturerName: "Texas Instruments", lifecycleStatus: "Active", productUrl: "https://avnet.com/lm317t" },
+        ] })],
+      ],
+      body: { pn: "LM317T" },
+    });
+    check("Avnet sozinho => active/medium", [parsed.status, parsed.confidence], ["active", "medium"]);
+    check("fabricante propagado da Avnet", parsed.manufacturer, "Texas Instruments");
+  }
+
+  console.log("\n== handler: novas fontes votam junto com as antigas ==");
+  {
+    const { parsed } = await invoke({
+      env: { MOUSER_API_KEY: "k", NEXAR_CLIENT_ID: "id", NEXAR_CLIENT_SECRET: "sec" },
+      routes: [
+        ["api.mouser.com", () => jsonRes(mouserBody([
+          { ManufacturerPartNumber: "LM317T", Manufacturer: "Texas Instruments", LifecycleStatus: "Active" }]))],
+        ["identity.nexar.com", () => jsonRes({ access_token: "t", expires_in: 600 })],
+        ["api.nexar.com/graphql", () => jsonRes({
+          data: { supSearchMpn: { results: [
+            { part: { mpn: "LM317T", manufacturer: { name: "Texas Instruments" }, lifecycleStatus: "Active" } },
+          ] } },
+        })],
+      ],
+      body: { pn: "LM317T" },
+    });
+    check("Mouser + Nexar concordando => high", parsed.confidence, "high");
+  }
+
+  console.log("\n== handler: fontes novas ausentes não quebram nada ==");
+  {
+    const { parsed } = await invoke({
+      env: { MOUSER_API_KEY: "k" },
+      routes: [["api.mouser.com", () => jsonRes(mouserBody([
+        { ManufacturerPartNumber: "X", Manufacturer: "TI", LifecycleStatus: "Active" }]))]],
+      body: { pn: "X" },
+    });
+    check("Nexar/Arrow/Avnet sem chave aparecem como não configuradas",
+      /Octopart\/Nexar: não configurada/.test(parsed.notes) &&
+      /Arrow: não configurada/.test(parsed.notes) &&
+      /Avnet: não configurada/.test(parsed.notes), true);
+    check("Mouser continua funcionando normalmente", parsed.status, "active");
+  }
+
   console.log("\n== handler: latência / timeout (orçamento de UX, sem teto de plataforma) ==");
   {
     const slow = () => new Promise((r) => setTimeout(() => r(jsonRes(mouserBody([]))), 3000));

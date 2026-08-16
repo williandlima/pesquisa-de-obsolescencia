@@ -1,18 +1,23 @@
-// Cloudflare Pages Function: /api/check-part  (v6 — portado da Netlify)
-// Consulta QUATRO fontes independentes e cruza os resultados:
+// Cloudflare Pages Function: /api/check-part  (v7 — mais fontes de lifecycle)
+// Consulta SETE fontes independentes e cruza os resultados:
 //   1. Mouser (distribuidor autorizado)
 //   2. Farnell/element14/Newark (distribuidor autorizado)
 //   3. TrustedParts.com / ECIA (agregador SÓ de canal autorizado, 2000+ fabricantes)
 //   4. Digi-Key (maior catálogo)
+//   5. Octopart/Nexar (agregador multi-distribuidor via GraphQL)
+//   6. Arrow Electronics (distribuidor autorizado)
+//   7. Avnet (distribuidor autorizado)
 //
 // Confiabilidade:
 //   - Cada fonte pode devolver MAIS DE UM fabricante para o mesmo PN (quando o
 //     usuário não informa fabricante). Em vez de escolher um arbitrariamente,
-//     agrupamos por fabricante ENTRE as 4 fontes e votamos dentro de cada grupo
+//     agrupamos por fabricante ENTRE as fontes e votamos dentro de cada grupo
 //     — assim "TI: active (2 fontes concordam)" e "onsemi: obsolete (1 fonte)"
 //     aparecem como candidatos separados, cada um com a confiança que merece.
 //   - Score de confiança ponderado por número de fontes que concordam DENTRO
-//     do mesmo grupo de fabricante.
+//     do mesmo grupo de fabricante. Octopart/Nexar pesa menos que um
+//     distribuidor direto porque ele mesmo agrega dados de várias das outras
+//     fontes (Mouser, Digi-Key, ...) — seu voto não é totalmente independente.
 //   - Casamento por PN + fabricante quando o usuário informa o fabricante (filtro
 //     é "soft": se nada bater, mostra os candidatos encontrados em vez de falhar).
 //   - Degradação graciosa: qualquer fonte pode falhar sem derrubar as outras, e
@@ -29,6 +34,9 @@
 //   FARNELL_API_KEY
 //   TRUSTEDPARTS_API_KEY + TRUSTEDPARTS_COMPANY_ID  (a ECIA exige os dois)
 //   DIGIKEY_CLIENT_ID + DIGIKEY_CLIENT_SECRET
+//   NEXAR_CLIENT_ID + NEXAR_CLIENT_SECRET  (Octopart/Nexar, cadastro em portal.nexar.com)
+//   ARROW_LOGIN + ARROW_API_KEY  (Arrow Electronics, developers.arrow.com)
+//   AVNET_CLIENT_ID + AVNET_CLIENT_SECRET + AVNET_SUBSCRIPTION_KEY  (apiportal.avnet.com)
 //   ALLOWED_ORIGIN (opcional — domínio liberado no CORS; ver DEFAULT_ALLOWED_ORIGIN)
 
 const MOUSER_URL = "https://api.mouser.com/api/v1/search/partnumber";
@@ -36,6 +44,11 @@ const FARNELL_URL = "https://api.element14.com/catalog/products";
 const TRUSTEDPARTS_URL = "https://api.trustedparts.com/v2/search";
 const DIGIKEY_TOKEN_URL = "https://api.digikey.com/v1/oauth2/token";
 const DIGIKEY_SEARCH_URL = "https://api.digikey.com/products/v4/search/keyword";
+const NEXAR_TOKEN_URL = "https://identity.nexar.com/connect/token";
+const NEXAR_GRAPHQL_URL = "https://api.nexar.com/graphql";
+const ARROW_URL = "https://api.arrow.com/itemservice/v4/en/search/token";
+const AVNET_TOKEN_URL = "https://api.avnet.com/oauth/token";
+const AVNET_SEARCH_URL = "https://api.avnet.com/v1/products/search";
 
 // Peso de cada tipo de fonte para o cálculo de confiança.
 // Distribuidor autorizado e canal-autorizado valem mais que agregador genérico.
@@ -44,6 +57,9 @@ const SOURCE_WEIGHT = {
   "Farnell/element14": 2,
   TrustedParts: 2,
   DigiKey: 2,
+  Arrow: 2,
+  Avnet: 2,
+  "Octopart/Nexar": 1,
 };
 
 // Quantos fabricantes distintos mostrar, por fonte e no total. Sem teto, um PN
@@ -601,6 +617,361 @@ async function queryDigiKey(pn, mfr, env) {
   }
 }
 
+// ---- Fonte 5: Octopart/Nexar (agregador multi-distribuidor, GraphQL) ----
+// Cadastro self-service em portal.nexar.com. Token OAuth2 client_credentials
+// (mesmo padrão de cache em módulo que o Digi-Key usa) seguido de uma query
+// GraphQL. O schema exato de alguns campos (ex.: se lifecycleStatus vem como
+// string livre) ainda não foi confirmado ao vivo — a busca abaixo tenta os
+// nomes mais prováveis e cai num debug com o corpo cru quando nada bate,
+// igual ao TrustedParts.
+let nexarTokenCache = null;
+let nexarTokenExpiry = 0;
+
+async function getNexarToken(env) {
+  const now = Date.now();
+  if (nexarTokenCache && now < nexarTokenExpiry - 60000) return { token: nexarTokenCache };
+
+  const clientId = env.NEXAR_CLIENT_ID;
+  const clientSecret = env.NEXAR_CLIENT_SECRET;
+  const missing = [
+    !clientId && "NEXAR_CLIENT_ID",
+    !clientSecret && "NEXAR_CLIENT_SECRET",
+  ].filter(Boolean);
+  if (missing.length) {
+    return { error: `falta a variável de ambiente ${missing.join(" e ")} no Cloudflare Pages` };
+  }
+
+  const body = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: clientId,
+    client_secret: clientSecret,
+  });
+
+  let res;
+  try {
+    res = await fetchWithRetry(
+      NEXAR_TOKEN_URL,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+        body: body.toString(),
+      },
+      1
+    );
+  } catch (e) {
+    return { error: `token: ${e.message}` };
+  }
+
+  let data;
+  try {
+    data = await readJson(res);
+  } catch (e) {
+    return { error: `token HTTP ${res.status}: ${e.message}` };
+  }
+
+  if (!res.ok || !data.access_token) {
+    const detail = [data.error, data.error_description].filter(Boolean).join(" — ") || JSON.stringify(data).slice(0, 160);
+    return { error: `token HTTP ${res.status}: ${detail}` };
+  }
+
+  nexarTokenCache = data.access_token;
+  nexarTokenExpiry = now + (data.expires_in || 1800) * 1000;
+  return { token: nexarTokenCache };
+}
+
+async function queryNexar(pn, mfr, env) {
+  if (!env.NEXAR_CLIENT_ID) return { results: [], debug: "não configurada" };
+
+  try {
+    const { token, error: tokenError } = await getNexarToken(env);
+    if (!token) return { results: [], debug: tokenError || "falha ao obter token OAuth2" };
+
+    const query = `
+      query PartSearch($q: String!) {
+        supSearchMpn(q: $q, limit: 5) {
+          results {
+            part {
+              mpn
+              manufacturer { name }
+              lifecycleStatus
+              octopartUrl
+              bestDatasheet { url }
+            }
+          }
+        }
+      }`;
+
+    const res = await fetchWithRetry(
+      NEXAR_GRAPHQL_URL,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ query, variables: { q: pn } }),
+      },
+      2
+    );
+
+    const data = await readJson(res);
+    if (Array.isArray(data.errors) && data.errors.length) {
+      return { results: [], debug: `GraphQL: ${data.errors.map((e) => e.message).join(", ")}` };
+    }
+
+    const matches = (data.data && data.data.supSearchMpn && data.data.supSearchMpn.results) || [];
+    const parts = matches.map((m) => m.part).filter(Boolean);
+    if (!parts.length) return { results: [], debug: "componente não encontrado" };
+
+    let pnExact = parts.filter((p) => p.mpn && p.mpn.toLowerCase() === pn.toLowerCase());
+    const pool = pnExact.length ? pnExact : parts;
+
+    const picks = pickManufacturerCandidates(pool, {
+      getMfr: (p) => p.manufacturer && p.manufacturer.name,
+      hasStatus: (p) => !!p.lifecycleStatus,
+      mfr,
+    });
+
+    const results = picks
+      .map((match) => {
+        const rawStatus = match.lifecycleStatus || "";
+        const status = normalizeStatus(rawStatus);
+        if (status === "unknown" && !rawStatus) return null;
+        return {
+          source: "Octopart/Nexar",
+          status,
+          rawStatus,
+          manufacturer: (match.manufacturer && match.manufacturer.name) || "",
+          substitute: "",
+          url: match.octopartUrl || "",
+          datasheetUrl: (match.bestDatasheet && match.bestDatasheet.url) || "",
+          leadTime: "",
+        };
+      })
+      .filter(Boolean);
+
+    if (!results.length) return { results: [], debug: "encontrado, mas sem lifecycleStatus preenchido" };
+    return { results, debug: "ok" };
+  } catch (e) {
+    console.error(`[check-part] Octopart/Nexar falhou para "${pn}":`, e.message);
+    return { results: [], debug: `erro: ${e.message}` };
+  }
+}
+
+// ---- Fonte 6: Arrow Electronics (distribuidor autorizado) ----
+// Autenticação por login+apikey como query params (não OAuth). O nome do
+// campo de status na resposta não foi confirmado ao vivo — tenta os
+// candidatos mais prováveis e cai num debug com o corpo cru se nada bater,
+// pra revelar o schema real no 1º teste (mesmo padrão do TrustedParts).
+async function queryArrow(pn, mfr, env) {
+  const login = env.ARROW_LOGIN;
+  const apiKey = env.ARROW_API_KEY;
+  if (!login || !apiKey) return { results: [], debug: "não configurada" };
+
+  try {
+    const params = new URLSearchParams({
+      login,
+      apikey: apiKey,
+      search_token: pn,
+      rows: "10",
+      fmt: "json",
+    });
+
+    const res = await fetchWithRetry(`${ARROW_URL}?${params.toString()}`, { method: "GET" }, 2);
+    const data = await readJson(res);
+
+    const items =
+      (data.searchTokenResult && data.searchTokenResult.items) ||
+      data.items ||
+      data.parts ||
+      [];
+    if (!Array.isArray(items) || !items.length) {
+      return { results: [], debug: "componente não encontrado" };
+    }
+
+    let pnExact = items.filter(
+      (p) => (p.partNum || p.partNumber || "").toLowerCase() === pn.toLowerCase()
+    );
+    const pool = pnExact.length ? pnExact : items;
+
+    const getStatus = (p) =>
+      p.reachStatus || p.lifecycleStatus || p.partStatus || p.productStatus || p.status || "";
+    const getMfr = (p) => p.mfrName || p.manufacturer || p.mfr || "";
+
+    const picks = pickManufacturerCandidates(pool, {
+      getMfr,
+      hasStatus: (p) => !!getStatus(p),
+      mfr,
+    });
+
+    const results = picks
+      .map((match) => {
+        const rawStatus = getStatus(match);
+        const status = normalizeStatus(rawStatus);
+        if (status === "unknown" && !rawStatus) return null;
+        return {
+          source: "Arrow",
+          status,
+          rawStatus,
+          manufacturer: getMfr(match),
+          substitute: "",
+          url: match.productUrl || match.detailUrl || "",
+          datasheetUrl: match.datasheetUrl || "",
+          leadTime: match.leadTime || "",
+        };
+      })
+      .filter(Boolean);
+
+    if (!results.length) {
+      return {
+        results: [],
+        debug: `encontrado, mas sem status reconhecível (schema não confirmado): ${JSON.stringify(pool[0]).slice(0, 160)}`,
+      };
+    }
+    return { results, debug: "ok" };
+  } catch (e) {
+    console.error(`[check-part] Arrow falhou para "${pn}":`, e.message);
+    return { results: [], debug: `erro: ${e.message}` };
+  }
+}
+
+// ---- Fonte 7: Avnet (distribuidor autorizado) ----
+// OAuth2 client_credentials + Subscription Key (padrão Azure APIM do portal
+// da Avnet). Endpoint de busca e nomes de campo ainda NÃO confirmados ao
+// vivo (docs do portal exigem cadastro aprovado manualmente) — implementação
+// best-effort com debug rico para ajuste no 1º teste real.
+let avnetTokenCache = null;
+let avnetTokenExpiry = 0;
+
+async function getAvnetToken(env) {
+  const now = Date.now();
+  if (avnetTokenCache && now < avnetTokenExpiry - 60000) return { token: avnetTokenCache };
+
+  const clientId = env.AVNET_CLIENT_ID;
+  const clientSecret = env.AVNET_CLIENT_SECRET;
+  const missing = [
+    !clientId && "AVNET_CLIENT_ID",
+    !clientSecret && "AVNET_CLIENT_SECRET",
+  ].filter(Boolean);
+  if (missing.length) {
+    return { error: `falta a variável de ambiente ${missing.join(" e ")} no Cloudflare Pages` };
+  }
+
+  const body = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: clientId,
+    client_secret: clientSecret,
+  });
+
+  let res;
+  try {
+    res = await fetchWithRetry(
+      AVNET_TOKEN_URL,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+        body: body.toString(),
+      },
+      1
+    );
+  } catch (e) {
+    return { error: `token: ${e.message}` };
+  }
+
+  let data;
+  try {
+    data = await readJson(res);
+  } catch (e) {
+    return { error: `token HTTP ${res.status}: ${e.message}` };
+  }
+
+  if (!res.ok || !data.access_token) {
+    const detail = [data.error, data.error_description].filter(Boolean).join(" — ") || JSON.stringify(data).slice(0, 160);
+    return { error: `token HTTP ${res.status}: ${detail}` };
+  }
+
+  avnetTokenCache = data.access_token;
+  avnetTokenExpiry = now + (data.expires_in || 1800) * 1000;
+  return { token: avnetTokenCache };
+}
+
+async function queryAvnet(pn, mfr, env) {
+  const subscriptionKey = env.AVNET_SUBSCRIPTION_KEY;
+  if (!env.AVNET_CLIENT_ID || !subscriptionKey) return { results: [], debug: "não configurada" };
+
+  try {
+    const { token, error: tokenError } = await getAvnetToken(env);
+    if (!token) return { results: [], debug: tokenError || "falha ao obter token OAuth2" };
+
+    const params = new URLSearchParams({ partNumber: pn });
+    const res = await fetchWithRetry(
+      `${AVNET_SEARCH_URL}?${params.toString()}`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Ocp-Apim-Subscription-Key": subscriptionKey,
+          Accept: "application/json",
+        },
+      },
+      2
+    );
+
+    const data = await readJson(res);
+    if (res.status >= 400) {
+      return { results: [], debug: `HTTP ${res.status}: ${JSON.stringify(data).slice(0, 160)}` };
+    }
+
+    const items = data.products || data.items || data.results || [];
+    if (!Array.isArray(items) || !items.length) {
+      return { results: [], debug: "componente não encontrado" };
+    }
+
+    let pnExact = items.filter(
+      (p) => (p.partNumber || p.mfrPartNumber || "").toLowerCase() === pn.toLowerCase()
+    );
+    const pool = pnExact.length ? pnExact : items;
+
+    const getStatus = (p) => p.lifecycleStatus || p.productStatus || p.status || "";
+    const getMfr = (p) => p.manufacturerName || p.manufacturer || "";
+
+    const picks = pickManufacturerCandidates(pool, {
+      getMfr,
+      hasStatus: (p) => !!getStatus(p),
+      mfr,
+    });
+
+    const results = picks
+      .map((match) => {
+        const rawStatus = getStatus(match);
+        const status = normalizeStatus(rawStatus);
+        if (status === "unknown" && !rawStatus) return null;
+        return {
+          source: "Avnet",
+          status,
+          rawStatus,
+          manufacturer: getMfr(match),
+          substitute: "",
+          url: match.productUrl || "",
+          datasheetUrl: match.datasheetUrl || "",
+          leadTime: match.leadTime || "",
+        };
+      })
+      .filter(Boolean);
+
+    if (!results.length) {
+      return {
+        results: [],
+        debug: `encontrado, mas sem status reconhecível (schema não confirmado): ${JSON.stringify(pool[0]).slice(0, 160)}`,
+      };
+    }
+    return { results, debug: "ok" };
+  } catch (e) {
+    console.error(`[check-part] Avnet falhou para "${pn}":`, e.message);
+    return { results: [], debug: `erro: ${e.message}` };
+  }
+}
+
 // Calcula status final + confiança ponderada a partir das fontes que responderam
 // para o MESMO fabricante (o agrupamento por fabricante acontece antes, no
 // handler — aqui as fontes já falam da mesma peça).
@@ -782,7 +1153,15 @@ export async function onRequest(context) {
 
   const trimmedPn = pn.trim();
 
-  if (!env.MOUSER_API_KEY && !env.FARNELL_API_KEY && !env.TRUSTEDPARTS_API_KEY && !env.DIGIKEY_CLIENT_ID) {
+  if (
+    !env.MOUSER_API_KEY &&
+    !env.FARNELL_API_KEY &&
+    !env.TRUSTEDPARTS_API_KEY &&
+    !env.DIGIKEY_CLIENT_ID &&
+    !env.NEXAR_CLIENT_ID &&
+    !env.ARROW_API_KEY &&
+    !env.AVNET_CLIENT_ID
+  ) {
     return new Response(
       JSON.stringify({ error: "Nenhuma fonte configurada no servidor." }),
       { status: 500, headers: cors }
@@ -790,11 +1169,14 @@ export async function onRequest(context) {
   }
 
   try {
-    const [mouserOut, farnellOut, tpOut, dkOut] = await Promise.all([
+    const [mouserOut, farnellOut, tpOut, dkOut, nexarOut, arrowOut, avnetOut] = await Promise.all([
       queryMouser(trimmedPn, mfr, env),
       queryFarnell(trimmedPn, mfr, env),
       queryTrustedParts(trimmedPn, mfr, env),
       queryDigiKey(trimmedPn, mfr, env),
+      queryNexar(trimmedPn, mfr, env),
+      queryArrow(trimmedPn, mfr, env),
+      queryAvnet(trimmedPn, mfr, env),
     ]);
 
     const outs = [
@@ -802,6 +1184,9 @@ export async function onRequest(context) {
       { name: "Farnell", out: farnellOut },
       { name: "TrustedParts", out: tpOut },
       { name: "DigiKey", out: dkOut },
+      { name: "Octopart/Nexar", out: nexarOut },
+      { name: "Arrow", out: arrowOut },
+      { name: "Avnet", out: avnetOut },
     ];
     const allResults = outs.flatMap(({ out }) => out.results || []);
 

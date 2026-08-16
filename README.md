@@ -34,6 +34,11 @@ nas notas do resultado entre colchetes.
 | Farnell / element14 (Newark) | `FARNELL_API_KEY` | Funcionando. `storeInfo.id` precisa ser `www.newark.com`. |
 | Digi-Key | `DIGIKEY_CLIENT_ID` + `DIGIKEY_CLIENT_SECRET` | OAuth2 `client_credentials` (2-legged), que é o fluxo documentado para a Product Information V4. Ainda não testada ao vivo. |
 | TrustedParts (ECIA) | `TRUSTEDPARTS_API_KEY` + `TRUSTEDPARTS_COMPANY_ID` | A API exige **Company ID e API Key no corpo** de toda requisição (PascalCase), não em header `Authorization`. Requer cadastro com e-mail corporativo. Ainda não testada ao vivo. |
+| Octopart / Nexar | `NEXAR_CLIENT_ID` + `NEXAR_CLIENT_SECRET` | Agregador multi-distribuidor via GraphQL, cadastro self-service em [portal.nexar.com](https://portal.nexar.com) (tem free tier). Pesa menos no cálculo de confiança porque já agrega dados de fontes que consultamos direto (Mouser, Digi-Key). Transporte (OAuth2 + endpoint) confirmado em doc pública; nomes exatos de campo do schema GraphQL ainda não testados ao vivo. |
+| Arrow Electronics | `ARROW_LOGIN` + `ARROW_API_KEY` | Distribuidor autorizado. Chave via [developers.arrow.com](https://developers.arrow.com/api/) ("Request API Key"), self-service. Endpoint confirmado; nome do campo de status na resposta ainda não confirmado ao vivo — o código tenta os candidatos mais prováveis e cai num debug com o corpo cru se nada bater. |
+| Avnet | `AVNET_CLIENT_ID` + `AVNET_CLIENT_SECRET` + `AVNET_SUBSCRIPTION_KEY` | Distribuidor autorizado. Cadastro em [apiportal.avnet.com](https://apiportal.avnet.com/) exige aprovação manual do lado da Avnet (não é instantâneo). Endpoint de busca e schema **não confirmados** (docs atrás de login) — implementação best-effort, precisa de ajuste no 1º teste ao vivo. |
+
+**Pendente** — RS Components/Electrocomponents não tem portal de developer self-service público conhecido; o acesso parece exigir contato comercial direto (gerente de conta). Não foi implementada por falta de documentação confiável; entra como 8ª fonte assim que houver credenciais e doc reais.
 
 Mais uma, opcional, específica desta plataforma:
 
@@ -44,16 +49,17 @@ Mais uma, opcional, específica desta plataforma:
 ## Como funciona a verificação
 
 - O navegador chama `/api/check-part` com `{ pn, mfr }`.
-- A função consulta as quatro fontes **em paralelo**, cada uma com orçamento de tempo
+- A função consulta as sete fontes **em paralelo**, cada uma com orçamento de tempo
   próprio — não é para caber num teto de plataforma (Workers HTTP não têm limite de
   wall-clock), é escolha de UX: uma fonte pendurada não pode travar as outras nem
   segurar quem está esperando o resultado por tempo demais.
 - Cada fonte normaliza o rótulo do distribuidor para `active` / `nrnd` / `obsolete` / `unknown`.
 - **Sem fabricante informado, cada fonte pode devolver mais de um fabricante** para o
   mesmo PN (o mesmo part number existe em vários fabricantes, com lifecycles distintos
-  — ex.: LM317T da TI, da onsemi, da ST). O backend agrupa os resultados das 4 fontes
-  por fabricante ANTES de votar, então cada fabricante recebe a confiança que realmente
-  merece, em vez de o app escolher um arbitrariamente ou diluir a confiança de todos.
+  — ex.: LM317T da TI, da onsemi, da ST). O backend agrupa os resultados de todas as
+  fontes por fabricante ANTES de votar, então cada fabricante recebe a confiança que
+  realmente merece, em vez de o app escolher um arbitrariamente ou diluir a confiança
+  de todos.
 - **Confiança**, calculada por grupo de fabricante: 2+ fontes conclusivas concordando
   sobre o mesmo fabricante → `alta`; fonte única → `média`; nenhuma conclusiva → `baixa`.
 - **Divergência** entre fontes conclusivas sobre o mesmo fabricante força `não
